@@ -2,9 +2,11 @@ import { ObjectId } from "mongodb";
 import { getAuthDb } from "../db/authDb.js";
 import { getTenantDb } from "../db/tenantDb.js";
 import { DHLIntegration } from "../integrations/DHL.js";
+import { LeopardIntegration } from "../integrations/Leopard.js";
 
 const CARRIER_CLASSES = {
   dhl: DHLIntegration,
+  leopard: LeopardIntegration,
 };
 
 /** Returns true if order has at least one of address1, city, postal_code, country_code. */

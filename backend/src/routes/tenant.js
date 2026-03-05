@@ -791,8 +791,11 @@ router.get("/consignments/:id/label", async (req, res) => {
     } catch {
       return res.status(400).json({ error: "Invalid id" });
     }
+    if (!tenantName) {
+      return res.status(403).json({ error: "Tenant context required" });
+    }
     if (!(await tenantDbExists(tenantName))) {
-      return res.status(404).json({ error: "Not found" });
+      return res.status(404).json({ error: "Tenant not found" });
     }
     const tenantDb = await getTenantDb(tenantName);
     const c = await tenantDb.collection("consignments").findOne({ _id: oid });
@@ -820,28 +823,28 @@ router.get("/consignments/:id/label", async (req, res) => {
     }
     const isHttpLabel = labelUrl && (labelUrl.startsWith("http://") || labelUrl.startsWith("https://")) && !labelUrl.toLowerCase().includes("tracking");
     if (isHttpLabel) {
-      return res.redirect(302, labelUrl);
+      const isApiUrl =
+        /api_key|api_key_secure|leopardscourier\.com/i.test(labelUrl);
+      if (isApiUrl) {
+        try {
+          const labelRes = await fetch(labelUrl, { redirect: "follow" });
+          if (labelRes.ok) {
+            const contentType = labelRes.headers.get("content-type") || "application/pdf";
+            const buf = Buffer.from(await labelRes.arrayBuffer());
+            res.setHeader("Content-Type", contentType);
+            res.setHeader("Content-Disposition", 'inline; filename="shipping-label.pdf"');
+            return res.send(buf);
+          }
+        } catch (e) {
+          console.warn("[label] proxy fetch failed, falling back to HTML:", e?.message);
+        }
+      } else {
+        return res.redirect(302, labelUrl);
+      }
     }
     if (!c.tracking_number) {
       return res.status(404).json({ error: "No label or tracking for this consignment" });
     }
-    const order = await tenantDb.collection("orders").findOne({ _id: c.order_id });
-    let company = null;
-    if (order?.company_id) {
-      company = await tenantDb.collection("companies").findOne({ _id: order.company_id });
-    }
-    const raw = order?.raw || {};
-    const shipping = order?.shipping_address || raw.shipping_address || raw.shippingAddress || {};
-    const toName = [shipping.first_name, shipping.last_name].filter(Boolean).join(" ") || shipping.name || "";
-    const toAddress = shipping.address1 || shipping.address_1 || "";
-    const toCity = shipping.city || "";
-    const toPostal = shipping.zip || shipping.postal_code || shipping.postal_code_zip || "";
-    const toCountry = (shipping.country_code || shipping.country || "").toString().toUpperCase().slice(0, 2) || "";
-    const fromName = company?.name || "Shipper";
-    const fromAddress = company?.address1 || company?.address?.address1 || "";
-    const fromCity = company?.city || company?.address?.city || "";
-    const fromPostal = company?.postal_code || company?.address?.postal_code || "";
-    const fromCountry = (company?.country_code || company?.address?.country_code || "").toString().toUpperCase().slice(0, 2) || "";
 
     const fs = "12px";
     const fwBold = "700";
@@ -849,6 +852,44 @@ router.get("/consignments/:id/label", async (req, res) => {
     const row = (label, value) =>
       value
         ? `<div style="margin:3px 0;font-size:${fs};line-height:1.4;"><span style="font-weight:${fwBold};min-width:5em;color:${color}">${escapeHtml(label)}:</span> <span style="color:${color}">${escapeHtml(value)}</span></div>`
+        : "";
+
+    let fromName = "Shipper";
+    let fromAddress = "";
+    let fromCity = "";
+    let fromPostal = "";
+    let fromCountry = "";
+    let toName = "Recipient";
+    let toAddress = "";
+    let toCity = "";
+    let toPostal = "";
+    let toCountry = "";
+    try {
+      const order = await tenantDb.collection("orders").findOne({ _id: c.order_id });
+      let company = null;
+      if (order?.company_id) {
+        company = await tenantDb.collection("companies").findOne({ _id: order.company_id });
+      }
+      const raw = order?.raw || {};
+      const shipping = order?.shipping_address || raw.shipping_address || raw.shippingAddress || {};
+      toName = [shipping.first_name, shipping.last_name].filter(Boolean).join(" ") || shipping.name || "Recipient";
+      toAddress = shipping.address1 || shipping.address_1 || "";
+      toCity = shipping.city || "";
+      toPostal = shipping.zip || shipping.postal_code || shipping.postal_code_zip || "";
+      toCountry = (shipping.country_code || shipping.country || "").toString().toUpperCase().slice(0, 2) || "";
+      fromName = company?.name || "Shipper";
+      fromAddress = company?.address1 || company?.address?.address1 || "";
+      fromCity = company?.city || company?.address?.city || "";
+      fromPostal = company?.postal_code || company?.address?.postal_code || "";
+      fromCountry = (company?.country_code || company?.address?.country_code || "").toString().toUpperCase().slice(0, 2) || "";
+    } catch (e) {
+      console.warn("[label] order/company lookup failed, using defaults:", e?.message);
+    }
+
+    const trackingUrl = (c.tracking_url && typeof c.tracking_url === "string" ? c.tracking_url.trim() : "") || "";
+    const trackLink =
+      trackingUrl && (trackingUrl.startsWith("http://") || trackingUrl.startsWith("https://"))
+        ? `<div style="margin-top:6px;"><a href="${escapeHtml(trackingUrl)}" target="_blank" rel="noopener" style="font-size:${fs};color:#2563eb;">Track package</a></div>`
         : "";
 
     const html = `<!DOCTYPE html>
@@ -866,14 +907,15 @@ router.get("/consignments/:id/label", async (req, res) => {
   </div>
   <div style="margin-top:14px;padding-top:8px;border-top:1px solid ${color}">
     <div style="font-size:${fs};font-weight:${fwBold};margin:0 0 3px 0;color:${color}">Tracking</div>
-    <div style="font-size:${fs};font-weight:${fwBold};letter-spacing:.04em;color:${color}">${escapeHtml(c.tracking_number)}</div>
+    <div style="font-size:${fs};font-weight:${fwBold};letter-spacing:.04em;color:${color}">${escapeHtml(String(c.tracking_number || ""))}</div>
+    ${trackLink}
   </div>
 </body></html>`;
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.send(html);
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Server error" });
+    console.error("[label] consignment label error:", err);
+    return res.status(500).json({ error: err.message || "Server error" });
   }
 });
 
