@@ -38,10 +38,13 @@ export async function runProductImportForTenant(tenantName) {
     try {
       const products = await Klass.fetchProducts(ci.credentials || {});
       for (const product of products) {
-        const existing = await productsColl.findOne({
-          external_id: product.external_id,
-          source: product.source || slug,
-        });
+        const extId = product.external_id;
+        const existing = extId
+          ? await productsColl.findOne({ external_id: extId })
+          : await productsColl.findOne({
+              external_id: product.external_id,
+              source: product.source || slug,
+            });
         const raw = product.raw || {};
         const variants = Array.isArray(product.variants) ? product.variants : [];
         const docBase = {
