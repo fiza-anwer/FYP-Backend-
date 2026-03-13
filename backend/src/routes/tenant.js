@@ -5,6 +5,13 @@ import { getAuthDb } from "../db/authDb.js";
 import { getTenantDb, tenantDbExists } from "../db/tenantDb.js";
 import { createConsignments } from "../services/consignmentService.js";
 import { dispatchOrders } from "../services/dispatchService.js";
+import { ensureInventoryForProduct, getInventoryByProductId, updateInventoryQuantity, decreaseAllocatedForOrderLineItems } from "../services/inventoryService.js";
+import { runOrderImportForTenant } from "../services/orderImportService.js";
+import {
+  runProductImportForTenant,
+  runPushPendingProductsForTenant,
+} from "../services/productImportService.js";
+import { syncInventoryToChannelsForTenant } from "../services/inventorySyncService.js";
 import { ShopifyIntegration } from "../integrations/Shopify.js";
 
 /** Normalize string or ObjectId to ObjectId for reliable lookups (handles both DB storage formats). */
@@ -197,6 +204,12 @@ router.post("/cleanup-orphaned-data", async (req, res) => {
     let deletedProducts = 0;
     let deletedCi = 0;
     if (orphanedOrderIds.length > 0) {
+      const orphanedOrders = await ordersColl.find({ _id: { $in: orphanedOrderIds } }).toArray();
+      for (const order of orphanedOrders) {
+        if (order.status !== "dispatched" && Array.isArray(order.line_items) && order.line_items.length > 0) {
+          await decreaseAllocatedForOrderLineItems(tenantDb, order);
+        }
+      }
       const consignResult = await consignmentsColl.deleteMany({ order_id: { $in: orphanedOrderIds } });
       deletedConsignments = consignResult.deletedCount;
       const r = await ordersColl.deleteMany({ _id: { $in: orphanedOrderIds } });
@@ -239,6 +252,56 @@ router.post("/cleanup-orphaned-data", async (req, res) => {
   }
 });
 
+/** Manually sync products, orders, and inventory for the current tenant */
+router.post("/sync", async (req, res) => {
+  try {
+    const tenantName = req.tenantName;
+    const result = {
+      products_imported: 0,
+      products_pushed: 0,
+      orders_imported: 0,
+      inventory_synced: 0,
+      errors: [],
+    };
+    // Push pending (local) products to Shopify first
+    const pushRes = await runPushPendingProductsForTenant(tenantName);
+    result.products_pushed = pushRes.pushed || 0;
+    if (Array.isArray(pushRes.errors) && pushRes.errors.length) {
+      result.errors.push(
+        ...pushRes.errors.map((e) => ({ scope: "products_push", error: e.error || String(e) }))
+      );
+    }
+    // Products import from channel
+    const prodRes = await runProductImportForTenant(tenantName);
+    result.products_imported = prodRes.imported || 0;
+    if (Array.isArray(prodRes.errors) && prodRes.errors.length) {
+      result.errors.push(
+        ...prodRes.errors.map((e) => ({ scope: "products", error: e.error || String(e) }))
+      );
+    }
+    // Orders
+    const orderRes = await runOrderImportForTenant(tenantName);
+    result.orders_imported = orderRes.imported || 0;
+    if (Array.isArray(orderRes.errors) && orderRes.errors.length) {
+      result.errors.push(
+        ...orderRes.errors.map((e) => ({ scope: "orders", error: e.error || String(e) }))
+      );
+    }
+    // Inventory sync to channels
+    const invRes = await syncInventoryToChannelsForTenant(tenantName);
+    result.inventory_synced = invRes.synced || 0;
+    if (Array.isArray(invRes.errors) && invRes.errors.length) {
+      result.errors.push(
+        ...invRes.errors.map((e) => ({ scope: "inventory", error: e.error || String(e) }))
+      );
+    }
+    return res.json(result);
+  } catch (err) {
+    console.error("Manual sync error:", err);
+    return res.status(500).json({ error: "Sync failed" });
+  }
+});
+
 /** List integration types (for dropdown) - from auth DB */
 router.get("/integrations", async (req, res) => {
   try {
@@ -261,6 +324,21 @@ router.get("/integrations", async (req, res) => {
     return res.status(500).json({ error: "Server error" });
   }
 });
+
+/** Normalize features array for company integrations (orders/products/inventory). */
+function normalizeIntegrationFeatures(features) {
+  const allowed = new Set(["orders", "products", "inventory"]);
+  if (!Array.isArray(features)) {
+    // Default: all enabled for backward compatibility
+    return ["orders", "products", "inventory"];
+  }
+  const out = [];
+  for (const f of features) {
+    const key = typeof f === "string" ? f.toLowerCase() : "";
+    if (allowed.has(key) && !out.includes(key)) out.push(key);
+  }
+  return out.length > 0 ? out : ["orders", "products", "inventory"];
+}
 
 /** List company integrations - from tenant DB */
 router.get("/company-integrations", async (req, res) => {
@@ -286,6 +364,7 @@ router.get("/company-integrations", async (req, res) => {
           const company = await companiesColl.findOne({ _id: new ObjectId(ci.company_id) });
           company_name = company?.name || null;
         }
+        const features = normalizeIntegrationFeatures(ci.features);
         return {
           id: ci._id.toString(),
           company_id: ci.company_id || null,
@@ -295,6 +374,7 @@ router.get("/company-integrations", async (req, res) => {
           integration_slug: integration?.slug || "",
           credentials: ci.credentials || {},
           status: ci.status === 1 ? 1 : 0,
+          features,
           created_at: ci.created_at,
           updated_at: ci.updated_at,
         };
@@ -311,7 +391,7 @@ router.get("/company-integrations", async (req, res) => {
 router.post("/company-integrations", async (req, res) => {
   try {
     const tenantName = req.tenantName;
-    const { company_id, integration_id, credentials, status } = req.body || {};
+    const { company_id, integration_id, credentials, status, features } = req.body || {};
     if (!integration_id) {
       return res.status(400).json({ error: "integration_id is required" });
     }
@@ -329,11 +409,13 @@ router.post("/company-integrations", async (req, res) => {
       return res.status(400).json({ error: "Company not found" });
     }
     const companyIntegrations = tenantDb.collection("company_integrations");
+    const normalizedFeatures = normalizeIntegrationFeatures(features);
     const doc = {
       company_id,
       integration_id,
       credentials: credentials || {},
       status: status === 1 ? 1 : 0,
+      features: normalizedFeatures,
       created_at: new Date(),
       updated_at: new Date(),
     };
@@ -359,6 +441,7 @@ router.post("/company-integrations", async (req, res) => {
       integration_slug: integration.slug,
       credentials: doc.credentials,
       status: doc.status,
+      features: normalizedFeatures,
       created_at: doc.created_at,
       updated_at: doc.updated_at,
       orders_linked: backfill.modifiedCount,
@@ -374,7 +457,7 @@ router.put("/company-integrations/:id", async (req, res) => {
   try {
     const tenantName = req.tenantName;
     const { id } = req.params;
-    const { company_id, credentials, status } = req.body || {};
+    const { company_id, credentials, status, features } = req.body || {};
     let oid;
     try {
       oid = new ObjectId(id);
@@ -395,6 +478,7 @@ router.put("/company-integrations/:id", async (req, res) => {
     }
     if (credentials !== undefined) update.credentials = credentials;
     if (status !== undefined) update.status = status === 1 ? 1 : 0;
+    if (features !== undefined) update.features = normalizeIntegrationFeatures(features);
     const result = await companyIntegrations.findOneAndUpdate(
       { _id: oid },
       { $set: update },
@@ -410,6 +494,7 @@ router.put("/company-integrations/:id", async (req, res) => {
       const company = await tenantDb.collection("companies").findOne({ _id: new ObjectId(result.company_id) });
       company_name = company?.name || null;
     }
+    const featuresOut = normalizeIntegrationFeatures(result.features);
     return res.json({
       id: result._id.toString(),
       company_id: result.company_id || null,
@@ -419,6 +504,7 @@ router.put("/company-integrations/:id", async (req, res) => {
       integration_slug: integration?.slug || "",
       credentials: result.credentials || {},
       status: result.status,
+      features: featuresOut,
       created_at: result.created_at,
       updated_at: result.updated_at,
     });
@@ -451,11 +537,12 @@ router.delete("/company-integrations/:id", async (req, res) => {
   }
 });
 
-/** List orders - for frontend orders screen; optional ?company_id= filter */
+/** List orders - for frontend orders screen; optional ?company_id= & ?sort= filter */
 router.get("/orders", async (req, res) => {
   try {
     const tenantName = req.tenantName;
     const companyId = req.query.company_id;
+    const sortParam = typeof req.query.sort === "string" ? req.query.sort.trim().toLowerCase() : "newest";
     if (!(await tenantDbExists(tenantName))) {
       return res.json({ orders: [] });
     }
@@ -464,15 +551,17 @@ router.get("/orders", async (req, res) => {
     const filter = {};
     if (companyId) {
       try {
-        filter.company_id = new ObjectId(companyId);
+        const companyOid = new ObjectId(companyId);
+        filter.company_id = { $in: [companyOid, companyId] };
       } catch {
         return res.status(400).json({ error: "Invalid company_id" });
       }
     }
+    const sortOrder = sortParam === "oldest" ? { created_at: 1 } : { created_at: -1 };
     const orders = await tenantDb
       .collection("orders")
       .find(filter)
-      .sort({ created_at: -1 })
+      .sort(sortOrder)
       .limit(500)
       .toArray();
     const list = await Promise.all(
@@ -535,11 +624,14 @@ function normalizeProductStatus(s) {
   return "active";
 }
 
-/** List products - optional ?company_id= filter */
+/** List products - optional ?company_id= & ?search= & ?product_type= & ?sort= */
 router.get("/products", async (req, res) => {
   try {
     const tenantName = req.tenantName;
     const companyId = req.query.company_id;
+    const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+    const productType = typeof req.query.product_type === "string" ? req.query.product_type.trim() : "";
+    const sortParam = typeof req.query.sort === "string" ? req.query.sort.trim().toLowerCase() : "newest";
     if (!(await tenantDbExists(tenantName))) {
       return res.json({ products: [] });
     }
@@ -548,17 +640,44 @@ router.get("/products", async (req, res) => {
     const filter = {};
     if (companyId) {
       try {
-        filter.company_id = new ObjectId(companyId);
+        const companyOid = new ObjectId(companyId);
+        filter.company_id = { $in: [companyOid, companyId] };
       } catch {
         return res.status(400).json({ error: "Invalid company_id" });
       }
     }
+    if (search) {
+      const re = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [
+        { title: re },
+        { sku: re },
+        { product_type: re },
+        { "variants.sku": re },
+        { "variants.option1": re },
+        { "variants.title": re },
+      ];
+    }
+    if (productType) {
+      const escaped = productType.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      filter.product_type = new RegExp(`^\\s*${escaped}\\s*$`, "i");
+    }
+    const sortOpts = {
+      newest: { created_at: -1 },
+      oldest: { created_at: 1 },
+      name_asc: { title: 1 },
+      name_desc: { title: -1 },
+      price_asc: { price: 1 },
+      price_desc: { price: -1 },
+    };
+    const sortOrder = sortOpts[sortParam] || sortOpts.newest;
     const products = await tenantDb
       .collection("products")
       .find(filter)
-      .sort({ created_at: -1 })
+      .sort(sortOrder)
       .limit(500)
       .toArray();
+    const inventoryColl = tenantDb.collection("inventory");
+    const channelProductsColl = tenantDb.collection("channel_products");
     const list = await Promise.all(
       products.map(async (p) => {
         let company_name = null;
@@ -566,6 +685,11 @@ router.get("/products", async (req, res) => {
           const company = await companiesColl.findOne({ _id: p.company_id });
           company_name = company?.name || null;
         }
+        const inv = await inventoryColl.findOne({ product_id: p._id });
+        const cp = await channelProductsColl.findOne({ product_id: p._id, channel_name: "shopify" });
+        const quantity = inv && typeof inv.quantity === "number" ? inv.quantity : 0;
+        const allocated = inv && typeof inv.allocated === "number" ? inv.allocated : 0;
+        const shopify_synced = !!(cp && (cp.channel_variant_id || cp.channel_product_id));
         return {
           id: p._id.toString(),
           company_id: p.company_id ? p.company_id.toString() : null,
@@ -578,6 +702,9 @@ router.get("/products", async (req, res) => {
           price: p.price,
           price_old: p.price_old,
           source: p.source,
+          quantity,
+          allocated,
+          shopify_synced,
           page_title: p.page_title || undefined,
           handle: p.handle || undefined,
           description: p.description || undefined,
@@ -703,6 +830,7 @@ router.post("/products", async (req, res) => {
     };
     const result = await productsColl.insertOne(doc);
     const created = { ...doc, _id: result.insertedId };
+    await ensureInventoryForProduct(tenantDb, result.insertedId);
     let company_name = null;
     if (created.company_id) {
       const company = await companiesColl.findOne({ _id: created.company_id });
@@ -725,6 +853,7 @@ router.post("/products", async (req, res) => {
           company_id: { $in: [companyOid, companyOid.toString()] },
           integration_id: { $in: [shopifyIntegration._id, shopifyIntegration._id.toString()] },
           status: 1,
+          $or: [{ features: { $exists: false } }, { features: "products" }],
         });
         if (ci && ci.credentials) {
           try {
@@ -750,6 +879,19 @@ router.post("/products", async (req, res) => {
               await productsColl.updateOne(
                 { _id: result.insertedId },
                 { $set: { external_id: pushResult.external_id, source: "shopify", status: "active", updated_at: new Date() } }
+              );
+              const cpColl = tenantDb.collection("channel_products");
+              await cpColl.updateOne(
+                { product_id: result.insertedId, channel_name: "shopify" },
+                {
+                  $set: {
+                    channel_product_id: pushResult.channel_product_id || pushResult.external_id,
+                    channel_variant_id: pushResult.channel_variant_id || null,
+                    channel_inventory_item_id: pushResult.channel_inventory_item_id || null,
+                    updated_at: new Date(),
+                  },
+                },
+                { upsert: true }
               );
               if (pushResult.categoryWarning) {
                 created._categoryWarning = pushResult.categoryWarning;
@@ -950,10 +1092,12 @@ router.post("/products/:id/push-to-shopify", async (req, res) => {
       company_id: { $in: [companyOid, companyOid.toString()] },
       integration_id: { $in: [shopifyIntegration._id, shopifyIntegration._id.toString()] },
       status: 1,
+      $or: [{ features: { $exists: false } }, { features: "products" }],
     });
     if (!ci || !ci.credentials) {
-      return res.status(400).json({
-        error: "No active Shopify connection for this product's company. Add Shopify in Company Integrations for the company.",
+      return res.status(200).json({
+        message: "Product saved. It will sync to Shopify when the company integration is active.",
+        id: p._id.toString(),
       });
     }
     const pushResult = await ShopifyIntegration.createProduct(ci.credentials, {
@@ -978,6 +1122,19 @@ router.post("/products/:id/push-to-shopify", async (req, res) => {
     await productsColl.updateOne(
       { _id: oid },
       { $set: { external_id: pushResult.external_id, source: "shopify", status: "active", updated_at: new Date() } }
+    );
+    const cpColl = tenantDb.collection("channel_products");
+    await cpColl.updateOne(
+      { product_id: oid, channel_name: "shopify" },
+      {
+        $set: {
+          channel_product_id: pushResult.channel_product_id || pushResult.external_id,
+          channel_variant_id: pushResult.channel_variant_id || null,
+          channel_inventory_item_id: pushResult.channel_inventory_item_id || null,
+          updated_at: new Date(),
+        },
+      },
+      { upsert: true }
     );
     const updated = await productsColl.findOne({ _id: oid });
     let company_name = null;
@@ -1028,7 +1185,173 @@ router.delete("/products/:id", async (req, res) => {
     if (result.deletedCount === 0) {
       return res.status(404).json({ error: "Product not found" });
     }
+    await tenantDb.collection("inventory").deleteMany({ product_id: oid });
+    await tenantDb.collection("channel_products").deleteMany({ product_id: oid });
     return res.json({ message: "Deleted" });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+/** List all inventory with product info (for Inventory screen); optional ?company_id= & ?search= & ?product_type= & ?sort= */
+router.get("/inventory", async (req, res) => {
+  try {
+    const tenantName = req.tenantName;
+    const companyId = req.query.company_id;
+    const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+    const productType = typeof req.query.product_type === "string" ? req.query.product_type.trim() : "";
+    const sortParam = typeof req.query.sort === "string" ? req.query.sort.trim().toLowerCase() : "newest";
+    if (!(await tenantDbExists(tenantName))) {
+      return res.json({ inventory: [] });
+    }
+    const tenantDb = await getTenantDb(tenantName);
+    const filter = {};
+    if (companyId) {
+      try {
+        const companyOid = new ObjectId(companyId);
+        filter.company_id = { $in: [companyOid, companyId] };
+      } catch {
+        return res.status(400).json({ error: "Invalid company_id" });
+      }
+    }
+    if (search) {
+      const re = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [
+        { title: re },
+        { sku: re },
+        { product_type: re },
+        { "variants.sku": re },
+        { "variants.option1": re },
+        { "variants.title": re },
+      ];
+    }
+    if (productType) {
+      const escaped = productType.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      filter.product_type = new RegExp(`^\\s*${escaped}\\s*$`, "i");
+    }
+    const sortOpts = {
+      newest: { created_at: -1 },
+      oldest: { created_at: 1 },
+      name_asc: { title: 1 },
+      name_desc: { title: -1 },
+    };
+    const sortOrder = sortOpts[sortParam] || { created_at: -1 };
+    const products = await tenantDb
+      .collection("products")
+      .find(filter)
+      .sort(sortOrder)
+      .limit(500)
+      .toArray();
+    const productIds = products.map((p) => p._id);
+    const inventoryDocs = await tenantDb
+      .collection("inventory")
+      .find({ product_id: { $in: productIds } })
+      .toArray();
+    const invByProduct = new Map(inventoryDocs.map((i) => [i.product_id.toString(), i]));
+    const cpDocs = await tenantDb
+      .collection("channel_products")
+      .find({ product_id: { $in: productIds }, channel_name: "shopify" })
+      .toArray();
+    const cpByProduct = new Map(cpDocs.map((c) => [c.product_id.toString(), c]));
+    const inventory = products.map((p) => {
+      const pid = p._id.toString();
+      const inv = invByProduct.get(pid);
+      const cp = cpByProduct.get(pid);
+      return {
+        product_id: pid,
+        title: p.title || "",
+        sku: p.sku || "",
+        quantity: inv && typeof inv.quantity === "number" ? inv.quantity : 0,
+        allocated: inv && typeof inv.allocated === "number" ? inv.allocated : 0,
+        shopify_synced: !!(cp && (cp.channel_variant_id || cp.channel_product_id)),
+      };
+    });
+    return res.json({ inventory });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+/** Get inventory for a product */
+router.get("/inventory/:product_id", async (req, res) => {
+  try {
+    const tenantName = req.tenantName;
+    const { product_id } = req.params;
+    let pid;
+    try {
+      pid = new ObjectId(product_id);
+    } catch {
+      return res.status(400).json({ error: "Invalid product id" });
+    }
+    if (!(await tenantDbExists(tenantName))) {
+      return res.status(400).json({ error: "Tenant has no data" });
+    }
+    const tenantDb = await getTenantDb(tenantName);
+    const inv = await getInventoryByProductId(tenantDb, pid);
+    if (!inv) {
+      await ensureInventoryForProduct(tenantDb, pid);
+      const created = await getInventoryByProductId(tenantDb, pid);
+      return res.json(created);
+    }
+    return res.json(inv);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+/** Update inventory quantity for a product; syncs to Shopify if mapped */
+router.patch("/inventory/:product_id", async (req, res) => {
+  try {
+    const tenantName = req.tenantName;
+    const { product_id } = req.params;
+    const { quantity } = req.body || {};
+    let pid;
+    try {
+      pid = new ObjectId(product_id);
+    } catch {
+      return res.status(400).json({ error: "Invalid product id" });
+    }
+    if (!(await tenantDbExists(tenantName))) {
+      return res.status(400).json({ error: "Tenant has no data" });
+    }
+    const tenantDb = await getTenantDb(tenantName);
+    const product = await tenantDb.collection("products").findOne({ _id: pid });
+    if (!product) return res.status(404).json({ error: "Product not found" });
+    const updated = await updateInventoryQuantity(tenantDb, pid, quantity);
+    if (!updated) return res.status(500).json({ error: "Failed to update inventory" });
+    const cp = await tenantDb.collection("channel_products").findOne({
+      product_id: pid,
+      channel_name: "shopify",
+      channel_inventory_item_id: { $nin: [null, ""] },
+    });
+    if (cp && product.company_id) {
+      const authDb = await getAuthDb();
+      const shopifyIntegration = await authDb.collection("integrations").findOne({ slug: "shopify" });
+      if (shopifyIntegration) {
+        const companyOid = product.company_id instanceof ObjectId ? product.company_id : new ObjectId(product.company_id);
+        const ci = await tenantDb.collection("company_integrations").findOne({
+          company_id: { $in: [companyOid, companyOid.toString()] },
+          integration_id: { $in: [shopifyIntegration._id, shopifyIntegration._id.toString()] },
+          status: 1,
+        });
+        if (ci?.credentials) {
+          try {
+            const setResult = await ShopifyIntegration.setInventory(
+              ci.credentials,
+              cp.channel_inventory_item_id,
+              updated.quantity
+            );
+            if (!setResult.success) console.error("[Shopify] Inventory sync after PATCH failed:", setResult.error);
+          } catch (e) {
+            console.error("[Shopify] Inventory sync after PATCH failed:", e?.message);
+          }
+        }
+      }
+    }
+    return res.json({ quantity: updated.quantity, allocated: updated.allocated });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Server error" });

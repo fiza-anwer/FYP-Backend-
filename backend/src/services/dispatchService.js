@@ -1,6 +1,7 @@
 import { ObjectId } from "mongodb";
 import { getAuthDb } from "../db/authDb.js";
 import { getTenantDb } from "../db/tenantDb.js";
+import { decreaseAllocatedForOrderLineItems } from "./inventoryService.js";
 import { ShopifyIntegration } from "../integrations/Shopify.js";
 
 const CHANNEL_FULFILL_CLASSES = {
@@ -98,6 +99,7 @@ export async function dispatchOrders(tenantName, orderIds) {
         { _id: orderId },
         { $set: { status: "dispatched", fulfillment_status: "fulfilled", updated_at: new Date() } }
       );
+      await decreaseAllocatedForOrderLineItems(tenantDb, order);
       dispatched++;
     } catch (err) {
       errors.push({ order_id: orderIdStr, error: err.message || String(err) });

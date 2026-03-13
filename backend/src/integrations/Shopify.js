@@ -269,6 +269,8 @@ export class ShopifyIntegration {
               sku: v?.sku && String(v.sku).trim() ? String(v.sku).trim() : undefined,
               option1: v?.option1 && String(v.option1).trim() ? String(v.option1).trim() : undefined,
               option2: v?.option2 && String(v.option2).trim() ? String(v.option2).trim() : undefined,
+              // Enable inventory tracking for variants we create
+              inventory_management: "shopify",
             };
           })
         : [{
@@ -276,6 +278,7 @@ export class ShopifyIntegration {
             price: String(product.price != null ? Number(product.price) : 0),
             compare_at_price: compareAtPrice != null ? String(compareAtPrice) : undefined,
             sku: product.sku && String(product.sku).trim() ? String(product.sku).trim() : undefined,
+            inventory_management: "shopify",
           }];
 
     const productTypeStr =
@@ -334,7 +337,80 @@ export class ShopifyIntegration {
         categoryWarning = err.message || "Category could not be set in Shopify.";
       }
     }
-    return { external_id: String(created.id), raw: created, categoryWarning };
+    const firstVariant = Array.isArray(created.variants) && created.variants[0] ? created.variants[0] : null;
+    const channel_product_id = String(created.id);
+    const channel_variant_id = firstVariant?.id ? String(firstVariant.id) : null;
+    const channel_inventory_item_id = firstVariant?.inventory_item_id ? String(firstVariant.inventory_item_id) : null;
+    return {
+      external_id: channel_product_id,
+      raw: created,
+      categoryWarning,
+      channel_product_id,
+      channel_variant_id,
+      channel_inventory_item_id,
+    };
+  }
+
+  /**
+   * Get the first location ID for the store (used for inventory set).
+   * @returns {Promise<number|null>}
+   */
+  static async getFirstLocationId(credentials) {
+    const { shop_domain, access_token } = normalizeShopifyCredentials(credentials);
+    if (!shop_domain || !access_token) return null;
+    const url = `https://${shop_domain}/admin/api/${SHOPIFY_API_VERSION}/locations.json?limit=1`;
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "X-Shopify-Access-Token": access_token,
+        "Content-Type": "application/json",
+      },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const loc = Array.isArray(data.locations) && data.locations[0] ? data.locations[0] : null;
+    return loc && loc.id != null ? Number(loc.id) : null;
+  }
+
+  /**
+   * Set inventory quantity for an inventory item at a location (Inventory Set API).
+   * @param {Object} credentials - { shop_domain, access_token }
+   * @param {string|number} inventoryItemId - Shopify inventory_item_id
+   * @param {number} quantity - Available quantity to set
+   * @param {number} [locationId] - Location ID; if not provided, first location is fetched
+   * @returns {Promise<{ success: boolean, error?: string }>}
+   */
+  static async setInventory(credentials, inventoryItemId, quantity, locationId) {
+    const { shop_domain, access_token } = normalizeShopifyCredentials(credentials);
+    if (!shop_domain || !access_token) {
+      return { success: false, error: "Shopify credentials missing" };
+    }
+    let locId = locationId;
+    if (locId == null || locId === "") {
+      locId = await this.getFirstLocationId(credentials);
+    }
+    if (locId == null) {
+      return { success: false, error: "No Shopify location found" };
+    }
+    const available = typeof quantity === "number" && !Number.isNaN(quantity) ? Math.max(0, Math.floor(quantity)) : 0;
+    const url = `https://${shop_domain}/admin/api/${SHOPIFY_API_VERSION}/inventory_levels/set.json`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "X-Shopify-Access-Token": access_token,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        location_id: Number(locId),
+        inventory_item_id: Number(inventoryItemId),
+        available,
+      }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      return { success: false, error: `Shopify inventory set ${res.status}: ${text.slice(0, 200)}` };
+    }
+    return { success: true };
   }
 
   /**

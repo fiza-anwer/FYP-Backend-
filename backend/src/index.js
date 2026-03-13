@@ -8,7 +8,11 @@ import { config } from "./config.js";
 import tenantRouter from "./routes/tenant.js";
 import authRouter from "./routes/auth.js";
 import { runOrderImportForAllTenants } from "./services/orderImportService.js";
-import { runProductImportForAllTenants } from "./services/productImportService.js";
+import {
+  runProductImportForAllTenants,
+  runPushPendingProductsForAllTenants,
+} from "./services/productImportService.js";
+import { syncInventoryToChannelsForAllTenants } from "./services/inventorySyncService.js";
 
 const app = express();
 
@@ -46,6 +50,24 @@ cron.schedule("*/5 * * * *", async () => {
   }
 });
 
+// Inventory sync to channels (e.g. Shopify) cron: every 5 minutes
+cron.schedule("*/5 * * * *", async () => {
+  try {
+    await syncInventoryToChannelsForAllTenants();
+  } catch (err) {
+    console.error("Inventory sync cron error:", err);
+  }
+});
+
+// Push pending products to Shopify (when integration becomes active) cron: every 5 minutes
+cron.schedule("*/5 * * * *", async () => {
+  try {
+    await runPushPendingProductsForAllTenants();
+  } catch (err) {
+    console.error("Push pending products cron error:", err);
+  }
+});
+
 async function start() {
   await connectMongo();
   console.log("MongoDB connected");
@@ -54,6 +76,8 @@ async function start() {
   }
   console.log("Order import cron: every 5 minutes");
   console.log("Product import cron: every 5 minutes");
+  console.log("Inventory sync cron: every 5 minutes");
+  console.log("Push pending products cron: every 5 minutes");
   const server = app.listen(config.port, () => {
     console.log("Server running on http://localhost:" + config.port);
   });

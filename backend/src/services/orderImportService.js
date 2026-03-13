@@ -1,6 +1,7 @@
 import { ObjectId } from "mongodb";
 import { getAuthDb } from "../db/authDb.js";
 import { getTenantDb, tenantDbExists } from "../db/tenantDb.js";
+import { increaseAllocatedForOrderLineItems } from "./inventoryService.js";
 import { ShopifyIntegration } from "../integrations/Shopify.js";
 
 const INTEGRATION_CLASSES = {
@@ -17,8 +18,15 @@ export async function runOrderImportForTenant(tenantName) {
   const integrationsColl = authDb.collection("integrations");
   const companyIntegrations = tenantDb.collection("company_integrations");
   const ordersColl = tenantDb.collection("orders");
+  const productsColl = tenantDb.collection("products");
 
-  const active = await companyIntegrations.find({ status: 1 }).toArray();
+  // Only integrations that have orders feature (or no features field = all)
+  const active = await companyIntegrations
+    .find({
+      status: 1,
+      $or: [{ features: { $exists: false } }, { features: "orders" }],
+    })
+    .toArray();
   let totalImported = 0;
   const errors = [];
 
@@ -33,6 +41,7 @@ export async function runOrderImportForTenant(tenantName) {
     }
     try {
       const orders = await Klass.fetchOrders(ci.credentials || {});
+      const companyOid = ci.company_id ? (typeof ci.company_id === "string" ? new ObjectId(ci.company_id) : ci.company_id) : null;
       for (const order of orders) {
         const existing = await ordersColl.findOne({ external_id: order.external_id, source: order.source || slug });
         const raw = order.raw || {};
@@ -47,9 +56,23 @@ export async function runOrderImportForTenant(tenantName) {
           last_name: ship.last_name || "",
           phone: ship.phone || "",
         };
+        const lineItems = [];
+        const rawLines = raw.line_items || [];
+        for (const li of rawLines) {
+          const sku = li.sku != null ? String(li.sku).trim() : "";
+          const qty = Math.max(0, parseInt(li.quantity ?? li.fulfillable_quantity ?? 1, 10) || 0);
+          if (!sku || qty === 0) continue;
+          const productFilter = companyOid
+            ? { company_id: { $in: [companyOid, companyOid.toString()] }, $or: [{ sku }, { "variants.sku": sku }] }
+            : { $or: [{ sku }, { "variants.sku": sku }] };
+          const product = await productsColl.findOne(productFilter);
+          if (product) {
+            lineItems.push({ product_id: product._id, quantity: qty });
+          }
+        }
         if (!existing) {
           await ordersColl.insertOne({
-            company_id: ci.company_id ? (typeof ci.company_id === "string" ? new ObjectId(ci.company_id) : ci.company_id) : null,
+            company_id: companyOid,
             status: "imported",
             external_id: order.external_id,
             order_number: order.order_number,
@@ -60,14 +83,16 @@ export async function runOrderImportForTenant(tenantName) {
             source: order.source || slug,
             raw,
             shipping_address,
+            line_items: lineItems,
             created_at: new Date(),
             updated_at: new Date(),
           });
+          await increaseAllocatedForOrderLineItems(tenantDb, lineItems);
           totalImported++;
         } else {
           await ordersColl.updateOne(
             { external_id: order.external_id, source: order.source || slug },
-            { $set: { shipping_address, raw, updated_at: new Date() } }
+            { $set: { shipping_address, raw, line_items: lineItems, updated_at: new Date() } }
           );
         }
       }
