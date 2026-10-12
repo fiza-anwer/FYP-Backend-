@@ -23,12 +23,25 @@ import { scanZeroStockForAllTenants } from "./src/services/stockAlertService.js"
 
 const app = express();
 
-app.use(
-  cors({
-    origin: config.frontendOrigin,
-    credentials: true,
-  })
-);
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://unisell-git-main-fiza-anwers-projects.vercel.app",
+  // production domain bhi add kar lo (Vercel Overview mein dikhta hai)
+  // "https://unisell.vercel.app",
+];
+
+// app.use(
+//   cors({
+//     origin: config.frontendOrigin,
+//     credentials: true,
+//   })
+// );
+
+app.use(cors({
+  origin: allowedOrigins,
+  credentials: true,
+}));
+
 app.use(express.json());
 app.use(cookieParser());
 
