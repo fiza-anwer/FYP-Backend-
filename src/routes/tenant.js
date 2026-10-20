@@ -33,18 +33,25 @@ import {
 } from "../services/geminiProductService.js";
 
 async function normalizeDarazCredentials(credentials) {
-  const creds = credentials || {};
-  if (creds.access_token) return creds;
-  if (creds.authorization_code) {
+  const creds = { ...(credentials || {}) };
+  // Prefer a fresh OAuth code over a stored access_token (reconnect used to keep the expired token).
+  const code = typeof creds.authorization_code === "string" ? creds.authorization_code.trim() : "";
+  if (code) {
     try {
-      return await DarazIntegration.exchangeCode(creds.authorization_code);
+      const exchanged = await DarazIntegration.exchangeCode(code);
+      return {
+        ...creds,
+        ...exchanged,
+        authorization_code: "",
+      };
     } catch (err) {
       console.error("[Daraz] Token exchange failed:", err.message);
       throw new Error(
-        "Daraz authorization code expired or invalid. Connect Daraz again in Company Integrations."
+        "Daraz authorization code expired or invalid. Connect Daraz again in Company Integrations, then Save immediately."
       );
     }
   }
+  if (creds.access_token) return creds;
   return creds;
 }
 
