@@ -17,4 +17,10 @@ export const config = {
   smtpUser: process.env.SMTP_USER || "",
   smtpPass: process.env.SMTP_PASS || "",
   mailFrom: process.env.MAIL_FROM || process.env.SMTP_USER || "noreply@unisell.local",
+  supportEmail: process.env.SUPPORT_EMAIL || "",
+  supportPhone: process.env.SUPPORT_PHONE || "",
+  supportWhatsapp: process.env.SUPPORT_WHATSAPP || "",
+  supportHours: process.env.SUPPORT_HOURS || "",
+  supportExpectedResponse: process.env.SUPPORT_EXPECTED_RESPONSE || "",
+  appVersion: process.env.npm_package_version || "1.0.0",
 };

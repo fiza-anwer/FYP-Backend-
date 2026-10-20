@@ -43,7 +43,7 @@ app.use(cors({
   credentials: true,
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: "8mb" }));
 app.use(cookieParser());
 
 app.get("/health", (req, res) => {
