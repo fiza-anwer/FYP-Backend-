@@ -80,92 +80,136 @@ function mapDarazOrder(order, items = []) {
   };
 }
 
+function tokenFieldsFromDaraz(data, extras = {}) {
+  return {
+    oauth_connected: "true",
+    authorization_code: "",
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || extras.refresh_token || "",
+    expires_in: data.expires_in != null ? String(data.expires_in) : "",
+    refresh_expires_in:
+      data.refresh_expires_in != null ? String(data.refresh_expires_in) : extras.refresh_expires_in || "",
+  };
+}
+
 export class DarazIntegration {
   static async exchangeCode(authorizationCode) {
     const data = await exchangeAuthorizationCode(authorizationCode);
-    return {
-      oauth_connected: "true",
-      authorization_code: String(authorizationCode),
-      access_token: data.access_token,
-      refresh_token: data.refresh_token || "",
-      expires_in: data.expires_in != null ? String(data.expires_in) : "",
-      refresh_expires_in: data.refresh_expires_in != null ? String(data.refresh_expires_in) : "",
-    };
+    return tokenFieldsFromDaraz(data);
+  }
+
+  static async refreshToken(credentials) {
+    const refresh = String(credentials?.refresh_token || "").trim();
+    if (!refresh) {
+      throw new Error(
+        "Daraz access token expired and no refresh token is stored. Connect Daraz again in Company Integrations."
+      );
+    }
+    const data = await refreshAuthorizationToken(refresh);
+    return tokenFieldsFromDaraz(data, { refresh_token: refresh });
   }
 
   static async ensureAccessToken(credentials) {
     const creds = credentials || {};
-    if (creds.access_token) return creds;
-    if (creds.authorization_code) {
-      const exchanged = await DarazIntegration.exchangeCode(creds.authorization_code);
+    const code = typeof creds.authorization_code === "string" ? creds.authorization_code.trim() : "";
+    if (code) {
+      const exchanged = await DarazIntegration.exchangeCode(code);
       return { ...creds, ...exchanged };
     }
+    if (creds.access_token) return creds;
     throw new Error(
       "Daraz is not fully connected. Open Company Integrations, select Daraz, and connect again."
     );
   }
 
-  static async fetchProducts(credentials) {
-    const creds = await DarazIntegration.ensureAccessToken(credentials);
-    const accessToken = creds.access_token;
-    const limit = 50;
-    let offset = 0;
-    const all = [];
-    let total = null;
+  static isAccessTokenError(err) {
+    const msg = String(err?.message || err || "");
+    return /IllegalAccessToken|access token is invalid|token.*expired|Invalid access_token/i.test(msg);
+  }
 
-    for (let page = 0; page < 100; page++) {
-      const data = await fetchProductsPage(accessToken, { offset, limit, filter: "all" });
-      const products = Array.isArray(data.products) ? data.products : [];
-      if (total == null && data.total_products != null) {
-        total = Number(data.total_products);
+  /**
+   * Run fn(accessToken); on expired token, refresh once and retry.
+   * Mutates `credentials` in place when refreshed so callers can persist it.
+   */
+  static async withRefreshedAccess(credentials, fn) {
+    let creds = await DarazIntegration.ensureAccessToken(credentials);
+    Object.assign(credentials, creds);
+    try {
+      return await fn(creds.access_token);
+    } catch (err) {
+      if (!DarazIntegration.isAccessTokenError(err) || !String(creds.refresh_token || "").trim()) {
+        throw err;
       }
-      for (const item of products) {
-        const mapped = mapDarazProduct(item);
-        if (mapped.external_id) all.push(mapped);
-      }
-      if (products.length < limit) break;
-      offset += limit;
-      if (total != null && offset >= total) break;
+      console.warn("[Daraz] access_token rejected; refreshing…");
+      const refreshed = await DarazIntegration.refreshToken(creds);
+      creds = { ...creds, ...refreshed };
+      Object.assign(credentials, creds);
+      return await fn(creds.access_token);
     }
+  }
 
-    return all;
+  static async fetchProducts(credentials) {
+    const creds = credentials || {};
+    return DarazIntegration.withRefreshedAccess(creds, async (accessToken) => {
+      const limit = 50;
+      let offset = 0;
+      const out = [];
+      let total = null;
+
+      for (let page = 0; page < 100; page++) {
+        const data = await fetchProductsPage(accessToken, { offset, limit, filter: "all" });
+        const products = Array.isArray(data.products) ? data.products : [];
+        if (total == null && data.total_products != null) {
+          total = Number(data.total_products);
+        }
+        for (const item of products) {
+          const mapped = mapDarazProduct(item);
+          if (mapped.external_id) out.push(mapped);
+        }
+        if (products.length < limit) break;
+        offset += limit;
+        if (total != null && offset >= total) break;
+      }
+      return out;
+    });
   }
 
   /** Pull orders from Daraz (last ~30 days). */
   static async fetchOrders(credentials) {
-    const creds = await DarazIntegration.ensureAccessToken(credentials);
-    const accessToken = creds.access_token;
-    const createdAfter = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-    const limit = 50;
-    let offset = 0;
-    const all = [];
+    const creds = credentials || {};
+    return DarazIntegration.withRefreshedAccess(creds, async (accessToken) => {
+      const createdAfter = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+      const limit = 50;
+      let offset = 0;
+      const all = [];
 
-    for (let page = 0; page < 50; page++) {
-      const data = await fetchOrdersPage(accessToken, { offset, limit, createdAfter });
-      const orders = Array.isArray(data.orders) ? data.orders : [];
-      for (const order of orders) {
-        const orderId = order.order_id ?? order.order_number;
-        let items = [];
-        if (orderId) {
-          try {
-            const itemData = await fetchOrderItems(accessToken, orderId);
-            items = Array.isArray(itemData) ? itemData : itemData.order_items || [];
-          } catch (err) {
-            console.warn("[Daraz] order items fetch failed for", orderId, err.message);
+      for (let page = 0; page < 50; page++) {
+        const data = await fetchOrdersPage(accessToken, { offset, limit, createdAfter });
+        const orders = Array.isArray(data.orders) ? data.orders : [];
+        for (const order of orders) {
+          const orderId = order.order_id ?? order.order_number;
+          let items = [];
+          if (orderId) {
+            try {
+              const itemData = await fetchOrderItems(accessToken, orderId);
+              items = Array.isArray(itemData) ? itemData : itemData.order_items || [];
+            } catch (err) {
+              console.warn("[Daraz] order items fetch failed for", orderId, err.message);
+            }
           }
+          if (items.length === 0 && Array.isArray(order.order_items)) {
+            items = order.order_items;
+          }
+          all.push(mapDarazOrder(order, items));
         }
-        if (items.length === 0 && Array.isArray(order.order_items)) {
-          items = order.order_items;
-        }
-        all.push(mapDarazOrder(order, items));
+        if (orders.length < limit) break;
+        offset += limit;
+        const count = data.count != null ? Number(data.count) : null;
+        if (count != null && offset >= count) break;
       }
-      if (orders.length < limit) break;
-      offset += limit;
-      const count = data.count != null ? Number(data.count) : null;
-      if (count != null && offset >= count) break;
-    }
 
-    return all;
+      return all;
+    });
   }
 
   /**
@@ -174,18 +218,20 @@ export class DarazIntegration {
    */
   static async setInventory(credentials, { sellerSku, skuId, quantity, price }) {
     try {
-      const creds = await DarazIntegration.ensureAccessToken(credentials);
+      const creds = credentials || {};
       if (!sellerSku && !skuId) {
         return { success: false, error: "Daraz SKU mapping missing (SellerSku or SkuId)" };
       }
-      await updateProductPriceQuantity(creds.access_token, [
-        {
-          sellerSku: sellerSku || undefined,
-          skuId: skuId || undefined,
-          quantity,
-          price: price != null ? price : undefined,
-        },
-      ]);
+      await DarazIntegration.withRefreshedAccess(creds, async (accessToken) => {
+        await updateProductPriceQuantity(accessToken, [
+          {
+            sellerSku: sellerSku || undefined,
+            skuId: skuId || undefined,
+            quantity,
+            price: price != null ? price : undefined,
+          },
+        ]);
+      });
       return { success: true };
     } catch (err) {
       return { success: false, error: err.message || String(err) };
