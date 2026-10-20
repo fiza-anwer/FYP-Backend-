@@ -87,14 +87,67 @@ export async function fetchCategoryAttributes(accessToken, categoryId) {
   return Array.isArray(data) ? data : data?.attributes || [];
 }
 
+function optionLabel(opt) {
+  return String(opt?.name || opt?.en_name || opt?.value || "").trim();
+}
+
+/** For dropdown/enum attributes, value MUST be one of attr.options (Daraz CHK_CATPROP_CPV_NOT_ENUM). */
+function pickEnumOption(attr, preferredTexts = []) {
+  const options = Array.isArray(attr.options) ? attr.options : [];
+  if (options.length === 0) return null;
+
+  const prefs = preferredTexts
+    .map((t) => String(t || "").trim().toLowerCase())
+    .filter(Boolean);
+
+  for (const pref of prefs) {
+    const exact = options.find((o) => optionLabel(o).toLowerCase() === pref);
+    if (exact) return optionLabel(exact);
+  }
+  for (const pref of prefs) {
+    if (pref === "no brand") continue;
+    const partial = options.find((o) => {
+      const label = optionLabel(o).toLowerCase();
+      return label.includes(pref) || pref.includes(label);
+    });
+    if (partial) return optionLabel(partial);
+  }
+
+  const noBrand = options.find((o) => /no\s*brand/i.test(optionLabel(o)));
+  if (noBrand) return optionLabel(noBrand);
+
+  const other = options.find((o) => /^other$/i.test(optionLabel(o)));
+  if (other) return optionLabel(other);
+
+  return optionLabel(options[0]) || null;
+}
+
 function pickAttributeValue(attr, product) {
-  const tag = attr.name;
+  const tag = String(attr.name || "").trim();
   const title = String(product.title || "").trim() || "Product";
   const desc =
     String(product.description || product.meta_description || "").trim() ||
     `<p>${title}</p>`;
   const shortDesc = desc.replace(/<[^>]+>/g, " ").trim().slice(0, 500) || title;
   const brand = String(product.vendor || product.brand || "").trim() || "No Brand";
+
+  const hasEnum =
+    (Array.isArray(attr.options) && attr.options.length > 0) ||
+    /singleSelect|multiSelect|enum|combobox|dropdown/i.test(String(attr.input_type || ""));
+
+  // Brand (p-20000) and other dropdowns: never send free text.
+  if (hasEnum || /^brand$/i.test(tag) || String(attr.id || "") === "20000" || tag === "p-20000") {
+    const enumVal = pickEnumOption(attr, [
+      brand,
+      "No Brand",
+      "No brand",
+      "Other",
+      "None",
+      "No Warranty",
+      "Multicolor",
+    ]);
+    if (enumVal) return enumVal;
+  }
 
   const byName = {
     name: title.slice(0, 255),
@@ -104,7 +157,6 @@ function pickAttributeValue(attr, product) {
     description_en: desc.slice(0, 25000),
     short_description: shortDesc.slice(0, 2500),
     short_description_en: shortDesc.slice(0, 2500),
-    brand,
     warranty_type: "No Warranty",
     warranty: "No Warranty",
     color_family: "Multicolor",
@@ -115,13 +167,7 @@ function pickAttributeValue(attr, product) {
   if (byName[tag]) return byName[tag];
 
   if (Array.isArray(attr.options) && attr.options.length > 0) {
-    const opt = attr.options.find(
-      (o) =>
-        String(o.name || o.en_name || "")
-          .toLowerCase()
-          .includes(brand.toLowerCase()) && brand.toLowerCase() !== "no brand"
-    );
-    return opt?.name || opt?.en_name || attr.options[0].name || attr.options[0].en_name || "Other";
+    return pickEnumOption(attr, [brand, "No Brand", "Other"]) || optionLabel(attr.options[0]);
   }
 
   if (attr.input_type === "numeric" || attr.input_type === "number") return "1";
