@@ -1,5 +1,6 @@
 import {
   exchangeAuthorizationCode,
+  refreshAuthorizationToken,
   fetchProductsPage,
   fetchOrdersPage,
   fetchOrderItems,
