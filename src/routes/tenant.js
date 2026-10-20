@@ -827,6 +827,15 @@ router.get("/products", async (req, res) => {
         const daraz_synced = isChannelProductSynced(cpByProduct.get(`${pid}:daraz`));
         const quantity = inv && typeof inv.quantity === "number" ? inv.quantity : 0;
         const allocated = inv && typeof inv.allocated === "number" ? inv.allocated : 0;
+        const rawImages = Array.isArray(p.raw?.images)
+          ? p.raw.images
+          : p.raw?.image
+            ? [p.raw.image]
+            : [];
+        const productImages = Array.isArray(p.images) && p.images.length > 0 ? p.images : rawImages;
+        const images = productImages
+          .map((image) => typeof image === "string" ? image : image?.src || image?.url)
+          .filter(Boolean);
         return {
           id: p._id.toString(),
           company_id: p.company_id ? p.company_id.toString() : null,
@@ -847,7 +856,7 @@ router.get("/products", async (req, res) => {
           meta_description: p.meta_description || undefined,
           handle: p.handle || undefined,
           description: p.description || undefined,
-          images: Array.isArray(p.images) ? p.images : undefined,
+          images,
           tags: Array.isArray(p.tags) ? p.tags : undefined,
           vendor: p.vendor || undefined,
           integration_slugs: Array.isArray(p.integration_slugs) ? p.integration_slugs : [],

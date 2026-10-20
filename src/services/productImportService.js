@@ -109,6 +109,14 @@ export async function runProductImportForTenant(tenantName) {
             $or: [{ sku: skuTrim }, { "variants.sku": skuTrim }],
           });
         }
+        const importedImages = Array.isArray(product.images)
+          ? product.images.filter(Boolean)
+          : [];
+        const rawImages = Array.isArray(raw.images)
+          ? raw.images.map((image) => image?.src || image?.url).filter(Boolean)
+          : raw.image?.src
+            ? [raw.image.src]
+            : [];
         const docBase = {
           company_id: companyOid,
           external_id: product.external_id,
@@ -118,6 +126,11 @@ export async function runProductImportForTenant(tenantName) {
           status: product.status || "active",
           price: typeof product.price === "number" ? product.price : null,
           source: product.source || slug,
+          images: importedImages.length > 0
+            ? importedImages
+            : rawImages.length > 0
+              ? rawImages
+              : existing?.images || [],
           variants,
           variant_count: variants.length,
           raw,
@@ -484,4 +497,3 @@ export async function runPushPendingProductsForAllTenants() {
   }
   return results;
 }
-

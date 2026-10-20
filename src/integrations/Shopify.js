@@ -230,6 +230,11 @@ export class ShopifyIntegration {
         product_type: p.product_type || "",
         status: p.status || "active",
         source: "shopify",
+        images: Array.isArray(p.images)
+          ? p.images.map((image) => image?.src || image?.url).filter(Boolean)
+          : p.image?.src
+            ? [p.image.src]
+            : [],
         raw: p,
         variants: variants.map((v) => ({
           id: v.id,
