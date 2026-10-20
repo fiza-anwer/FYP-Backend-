@@ -73,7 +73,17 @@ export async function exchangeAuthorizationCode(code) {
   }
   return data;
 }
-
+/** Refresh an expired access_token using refresh_token. */
+export async function refreshAuthorizationToken(refreshToken) {
+  const json = await darazGet("/auth/token/refresh", {
+    refresh_token: String(refreshToken),
+  });
+  const data = json.data || json;
+  if (!data.access_token) {
+    throw new Error("Daraz token refresh did not return access_token");
+  }
+  return data;
+}
 /** Fetch one page of seller products. */
 export async function fetchProductsPage(accessToken, { offset = 0, limit = 50, filter = "all" } = {}) {
   const json = await darazGet(
