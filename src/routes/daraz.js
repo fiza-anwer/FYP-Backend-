@@ -1,4 +1,5 @@
 import express from "express";
+import { DarazIntegration } from "../integrations/Daraz.js";
 
 const router = express.Router();
 
@@ -28,28 +29,66 @@ router.get("/connect", async (req, res) => {
 });
 
 router.get("/callback", async (req, res) => {
-  const { code } = req.query;
+  const { code, error, error_description } = req.query;
 
   try {
-    console.log("Authorization code:", code);
+    if (error) {
+      const detail = String(error_description || error);
+      console.error("[Daraz] OAuth denied:", detail);
+      return res.send(oauthPopupHtml({ ok: false, message: detail }));
+    }
 
-    // TODO:
-    // Exchange code for token here
+    if (!code) {
+      return res.send(oauthPopupHtml({ ok: false, message: "No authorization code returned from Daraz." }));
+    }
 
-    const safeCode = code ? String(code).replace(/\\/g, "\\\\").replace(/'/g, "\\'") : "";
-    res.send(`
-      <script>
-        window.opener.postMessage(
-          { type: "DARAZ_CONNECTED", code: "${safeCode}" },
-          "*"
-        );
-        window.close();
-      </script>
-    `);
-  } catch (error) {
-    console.log(error);
-    res.send("OAuth failed");
+    // Exchange immediately — Daraz codes are single-use and expire within minutes.
+    console.log("[Daraz] exchanging authorization code…");
+    const tokens = await DarazIntegration.exchangeCode(String(code));
+    console.log("[Daraz] token exchange ok");
+
+    return res.send(
+      oauthPopupHtml({
+        ok: true,
+        credentials: {
+          oauth_connected: "true",
+          authorization_code: "",
+          access_token: tokens.access_token || "",
+          refresh_token: tokens.refresh_token || "",
+          expires_in: tokens.expires_in || "",
+          refresh_expires_in: tokens.refresh_expires_in || "",
+        },
+      })
+    );
+  } catch (err) {
+    console.error("[Daraz] callback exchange failed:", err.message);
+    return res.send(
+      oauthPopupHtml({
+        ok: false,
+        message: err.message || "Daraz OAuth failed",
+      })
+    );
   }
 });
+
+function oauthPopupHtml({ ok, credentials, message }) {
+  const payload = ok
+    ? { type: "DARAZ_CONNECTED", ok: true, credentials }
+    : { type: "DARAZ_CONNECTED", ok: false, error: message || "OAuth failed" };
+  const json = JSON.stringify(payload).replace(/</g, "\\u003c");
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Daraz</title></head>
+<body>
+<p>${ok ? "Daraz connected. You can close this window." : "Daraz connect failed."}</p>
+<script>
+  try {
+    if (window.opener) {
+      window.opener.postMessage(${json}, "*");
+    }
+  } catch (e) {}
+  setTimeout(function () { window.close(); }, 400);
+</script>
+</body></html>`;
+}
 
 export default router;
