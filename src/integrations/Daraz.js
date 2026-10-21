@@ -1,6 +1,7 @@
 import {
   exchangeAuthorizationCode,
   refreshAuthorizationToken,
+  fetchSellerProfile,
   fetchProductsPage,
   fetchOrdersPage,
   fetchOrderItems,
@@ -95,7 +96,20 @@ function tokenFieldsFromDaraz(data, extras = {}) {
 export class DarazIntegration {
   static async exchangeCode(authorizationCode) {
     const data = await exchangeAuthorizationCode(authorizationCode);
-    return tokenFieldsFromDaraz(data);
+    const seller = await fetchSellerProfile(data.access_token);
+    const shortCode = String(seller.short_code || "").trim();
+    if (!shortCode) {
+      throw new Error("Daraz seller profile did not return a shop short code");
+    }
+
+    const apiHost = new URL(process.env.DARAZ_API_URL || "https://api.daraz.pk/rest").hostname;
+    const storefrontHost = apiHost.replace(/^api\./i, "www.");
+    return {
+      ...tokenFieldsFromDaraz(data),
+      storefront_url: `https://${storefrontHost}/shop/${encodeURIComponent(shortCode)}/`,
+      shop_name: String(seller.name || "").trim(),
+      shop_short_code: shortCode,
+    };
   }
 
   static async refreshToken(credentials) {

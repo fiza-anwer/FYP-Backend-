@@ -73,6 +73,17 @@ export async function exchangeAuthorizationCode(code) {
   }
   return data;
 }
+
+/** Fetch the connected seller profile, including the public shop short code. */
+export async function fetchSellerProfile(accessToken) {
+  const json = await darazGet("/seller/get", {}, accessToken);
+  const data = json.data || json;
+  if (!data || typeof data !== "object") {
+    throw new Error("Daraz seller profile response was empty");
+  }
+  return data;
+}
+
 /** Refresh an expired access_token using refresh_token. */
 export async function refreshAuthorizationToken(refreshToken) {
   const json = await darazGet("/auth/token/refresh", {

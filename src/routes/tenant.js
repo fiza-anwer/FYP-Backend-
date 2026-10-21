@@ -727,6 +727,116 @@ router.get("/orders", async (req, res) => {
   }
 });
 
+/** Aggregate sales and orders by company and sales channel for a report date range. */
+router.get("/reports/sales", async (req, res) => {
+  try {
+    const tenantName = req.tenantName;
+    const { from, to } = req.query;
+    const interval = req.query.interval === "day" ? "day" : "month";
+    const isDateOnly = (value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+    if (!isDateOnly(from) || !isDateOnly(to)) {
+      return res.status(400).json({ error: "Valid from and to dates are required (YYYY-MM-DD)." });
+    }
+
+    const startDate = new Date(`${from}T00:00:00.000Z`);
+    const endDate = new Date(`${to}T00:00:00.000Z`);
+    if (
+      Number.isNaN(startDate.getTime()) ||
+      Number.isNaN(endDate.getTime()) ||
+      startDate.toISOString().slice(0, 10) !== from ||
+      endDate.toISOString().slice(0, 10) !== to ||
+      endDate < startDate
+    ) {
+      return res.status(400).json({ error: "The report date range is invalid." });
+    }
+
+    if (!(await tenantDbExists(tenantName))) {
+      return res.json({ from, to, rows: [] });
+    }
+
+    const tenantDb = await getTenantDb(tenantName);
+    const groups = await tenantDb.collection("orders").aggregate([
+      {
+        $match: {
+          created_at: {
+            $gte: startDate,
+            $lt: new Date(endDate.getTime() + 24 * 60 * 60 * 1000),
+          },
+        },
+      },
+      {
+        $group: {
+          _id: {
+            company_id: { $toString: "$company_id" },
+            source: { $toLower: { $ifNull: ["$source", "unknown"] } },
+            currency: {
+              $toUpper: {
+                $toString: {
+                  $ifNull: ["$currency", { $ifNull: ["$raw.currency", { $ifNull: ["$raw.currency_code", "Unknown"] }] }],
+                },
+              },
+            },
+            period: {
+              $dateToString: {
+                format: interval === "day" ? "%Y-%m-%d" : "%Y-%m",
+                date: "$created_at",
+                timezone: "UTC",
+              },
+            },
+          },
+          order_count: { $sum: 1 },
+          sales: {
+            $sum: {
+              $convert: {
+                input: "$total",
+                to: "double",
+                onError: 0,
+                onNull: 0,
+              },
+            },
+          },
+        },
+      },
+      { $sort: { "_id.period": 1, "_id.company_id": 1, "_id.source": 1 } },
+    ]).toArray();
+
+    const companyIds = [...new Set(groups.map((group) => group._id.company_id).filter((id) => id && id !== "null"))];
+    const companies = await tenantDb.collection("companies")
+      .find({ _id: { $in: companyIds.map((id) => new ObjectId(id)) } })
+      .project({ _id: 1, name: 1 })
+      .toArray();
+    const companyNames = new Map(companies.map((company) => [company._id.toString(), company.name]));
+    const authDb = await getAuthDb();
+    const integrations = await authDb.collection("integrations")
+      .find({})
+      .project({ slug: 1, name: 1 })
+      .toArray();
+    const integrationNames = new Map(integrations.map((integration) => [String(integration.slug || "").toLowerCase(), integration.name]));
+
+    return res.json({
+      from,
+      to,
+      rows: groups.map((group) => {
+        const companyId = group._id.company_id === "null" ? null : group._id.company_id;
+        const source = group._id.source || "unknown";
+        return {
+          company_id: companyId,
+          company_name: (companyId && companyNames.get(companyId)) || "Unassigned",
+          source,
+          store_name: integrationNames.get(source) || source.charAt(0).toUpperCase() + source.slice(1),
+          period: group._id.period,
+          currency: group._id.currency === "UNKNOWN" ? null : group._id.currency,
+          order_count: group.order_count,
+          sales: group.sales,
+        };
+      }),
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to generate sales report." });
+  }
+});
+
 // ---------- Products ----------
 
 const PRODUCT_STATUSES = ["active", "draft", "archived"];
