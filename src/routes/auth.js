@@ -24,10 +24,34 @@ import {
 const router = Router();
 const PASSWORD_ATTEMPT_LIMIT = 5;
 const PASSWORD_ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
+const TRUSTED_DEVICE_COOKIE = "unisell_trusted_device";
+const TRUSTED_DEVICE_DURATION_MS = 180 * 24 * 60 * 60 * 1000;
 const SUPPORT_UPLOAD_MAX_BYTES = 5 * 1024 * 1024;
 const SUPPORT_CATEGORIES = new Set(["Account", "Product", "Order", "Integration", "Other"]);
 const SUPPORT_PRIORITIES = new Set(["Low", "Normal", "High", "Urgent"]);
 const SUPPORT_ATTACHMENT_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "application/pdf"]);
+
+function trustedDeviceCookieOptions(maxAge) {
+  const secure = process.env.NODE_ENV === "production";
+  return {
+    httpOnly: true,
+    secure,
+    sameSite: secure ? "none" : "lax",
+    path: "/api/auth",
+    maxAge,
+  };
+}
+
+async function isTrustedDevice(db, req, userKey) {
+  const token = req.cookies?.[TRUSTED_DEVICE_COOKIE];
+  if (!token) return false;
+  const record = await db.collection("auth_trusted_devices").findOne({
+    _id: hashToken(token),
+    user_key: userKey,
+    expires_at: { $gt: new Date() },
+  });
+  return Boolean(record);
+}
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (character) => ({
@@ -204,7 +228,8 @@ router.post("/login", async (req, res) => {
       if (!match) {
         return res.status(401).json({ error: "Invalid email or password" });
       }
-      if (superadmin.two_factor_enabled) {
+      const userKey = `superadmin:${superadmin._id}`;
+      if (superadmin.two_factor_enabled && !(await isTrustedDevice(db, req, userKey))) {
         const challengeToken = jwt.sign(
           { email: em, role: "superadmin", purpose: "login_2fa" },
           config.jwtSecret,
@@ -212,7 +237,6 @@ router.post("/login", async (req, res) => {
         );
         return res.json({ requires_two_factor: true, challenge_token: challengeToken });
       }
-      const userKey = `superadmin:${superadmin._id}`;
       const session = await createAuthenticatedSession(db, req, userKey, { email: em, role: "superadmin" });
       await superadminsCol.updateOne({ _id: superadmin._id }, { $set: { last_login_at: new Date() } });
       return res.json({
@@ -245,7 +269,8 @@ router.post("/login", async (req, res) => {
     if (!match) {
       return res.status(401).json({ error: "Invalid email or password" });
     }
-    if (tenantUser.two_factor_enabled) {
+    const userKey = `tenant:${tenant.tenant_name}:${tenantUser._id}`;
+    if (tenantUser.two_factor_enabled && !(await isTrustedDevice(db, req, userKey))) {
       const challengeToken = jwt.sign(
         { email: em, role: "tenant", tenant_name: tenant.tenant_name, purpose: "login_2fa" },
         config.jwtSecret,
@@ -253,7 +278,6 @@ router.post("/login", async (req, res) => {
       );
       return res.json({ requires_two_factor: true, challenge_token: challengeToken });
     }
-    const userKey = `tenant:${tenant.tenant_name}:${tenantUser._id}`;
     const session = await createAuthenticatedSession(db, req, userKey, {
       email: em,
       role: "tenant",
@@ -344,6 +368,20 @@ router.post("/two-factor/login", async (req, res) => {
       return res.status(401).json({ error: "This verification code has already been used" });
     }
     await db.collection("security_attempts").deleteOne({ _id: attemptKey });
+    const trustedDeviceToken = createToken();
+    const trustedDeviceCreatedAt = new Date();
+    await db.collection("auth_trusted_devices").insertOne({
+      _id: hashToken(trustedDeviceToken),
+      user_key: userKey,
+      created_at: trustedDeviceCreatedAt,
+      expires_at: new Date(trustedDeviceCreatedAt.getTime() + TRUSTED_DEVICE_DURATION_MS),
+      user_agent: String(req.get("user-agent") || "Unknown device").slice(0, 300),
+    });
+    res.cookie(
+      TRUSTED_DEVICE_COOKIE,
+      trustedDeviceToken,
+      trustedDeviceCookieOptions(TRUSTED_DEVICE_DURATION_MS)
+    );
     const session = await createAuthenticatedSession(db, req, userKey, {
       email: challenge.email,
       role: challenge.role,
@@ -437,6 +475,9 @@ router.post("/two-factor/enable", authMiddleware, async (req, res) => {
         $unset: { two_factor_setup_secret: "", two_factor_setup_expires_at: "" },
       }
     );
+    await db.collection("auth_trusted_devices").deleteMany({
+      user_key: req.user.sub,
+    });
     return res.json({ message: "Two-factor authentication enabled." });
   } catch (err) {
     console.error("Enable two-factor error:", err);
@@ -466,6 +507,8 @@ router.post("/two-factor/disable", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Current password or authenticator code is incorrect" });
     }
     await db.collection("security_attempts").deleteOne({ _id: attemptKey });
+    await db.collection("auth_trusted_devices").deleteMany({ user_key: req.user.sub });
+    res.clearCookie(TRUSTED_DEVICE_COOKIE, trustedDeviceCookieOptions(0));
     await collection.updateOne(
       { _id: account._id },
       {
