@@ -539,8 +539,11 @@ router.post("/company-integrations", async (req, res) => {
       orders_linked: backfill.modifiedCount,
     });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Server error" });
+    console.error("[company-integrations POST]", err);
+    const msg = err?.message || "Server error";
+    return res.status(500).json({
+      error: /Daraz|authorization|token|credential/i.test(msg) ? msg : "Server error",
+    });
   }
 });
 
@@ -614,8 +617,11 @@ router.put("/company-integrations/:id", async (req, res) => {
       updated_at: result.updated_at,
     });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Server error" });
+    console.error("[company-integrations PUT]", err);
+    const msg = err?.message || "Server error";
+    return res.status(500).json({
+      error: /Daraz|authorization|token|credential/i.test(msg) ? msg : "Server error",
+    });
   }
 });
 
@@ -727,116 +733,6 @@ router.get("/orders", async (req, res) => {
   }
 });
 
-/** Aggregate sales and orders by company and sales channel for a report date range. */
-router.get("/reports/sales", async (req, res) => {
-  try {
-    const tenantName = req.tenantName;
-    const { from, to } = req.query;
-    const interval = req.query.interval === "day" ? "day" : "month";
-    const isDateOnly = (value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
-    if (!isDateOnly(from) || !isDateOnly(to)) {
-      return res.status(400).json({ error: "Valid from and to dates are required (YYYY-MM-DD)." });
-    }
-
-    const startDate = new Date(`${from}T00:00:00.000Z`);
-    const endDate = new Date(`${to}T00:00:00.000Z`);
-    if (
-      Number.isNaN(startDate.getTime()) ||
-      Number.isNaN(endDate.getTime()) ||
-      startDate.toISOString().slice(0, 10) !== from ||
-      endDate.toISOString().slice(0, 10) !== to ||
-      endDate < startDate
-    ) {
-      return res.status(400).json({ error: "The report date range is invalid." });
-    }
-
-    if (!(await tenantDbExists(tenantName))) {
-      return res.json({ from, to, rows: [] });
-    }
-
-    const tenantDb = await getTenantDb(tenantName);
-    const groups = await tenantDb.collection("orders").aggregate([
-      {
-        $match: {
-          created_at: {
-            $gte: startDate,
-            $lt: new Date(endDate.getTime() + 24 * 60 * 60 * 1000),
-          },
-        },
-      },
-      {
-        $group: {
-          _id: {
-            company_id: { $toString: "$company_id" },
-            source: { $toLower: { $ifNull: ["$source", "unknown"] } },
-            currency: {
-              $toUpper: {
-                $toString: {
-                  $ifNull: ["$currency", { $ifNull: ["$raw.currency", { $ifNull: ["$raw.currency_code", "Unknown"] }] }],
-                },
-              },
-            },
-            period: {
-              $dateToString: {
-                format: interval === "day" ? "%Y-%m-%d" : "%Y-%m",
-                date: "$created_at",
-                timezone: "UTC",
-              },
-            },
-          },
-          order_count: { $sum: 1 },
-          sales: {
-            $sum: {
-              $convert: {
-                input: "$total",
-                to: "double",
-                onError: 0,
-                onNull: 0,
-              },
-            },
-          },
-        },
-      },
-      { $sort: { "_id.period": 1, "_id.company_id": 1, "_id.source": 1 } },
-    ]).toArray();
-
-    const companyIds = [...new Set(groups.map((group) => group._id.company_id).filter((id) => id && id !== "null"))];
-    const companies = await tenantDb.collection("companies")
-      .find({ _id: { $in: companyIds.map((id) => new ObjectId(id)) } })
-      .project({ _id: 1, name: 1 })
-      .toArray();
-    const companyNames = new Map(companies.map((company) => [company._id.toString(), company.name]));
-    const authDb = await getAuthDb();
-    const integrations = await authDb.collection("integrations")
-      .find({})
-      .project({ slug: 1, name: 1 })
-      .toArray();
-    const integrationNames = new Map(integrations.map((integration) => [String(integration.slug || "").toLowerCase(), integration.name]));
-
-    return res.json({
-      from,
-      to,
-      rows: groups.map((group) => {
-        const companyId = group._id.company_id === "null" ? null : group._id.company_id;
-        const source = group._id.source || "unknown";
-        return {
-          company_id: companyId,
-          company_name: (companyId && companyNames.get(companyId)) || "Unassigned",
-          source,
-          store_name: integrationNames.get(source) || source.charAt(0).toUpperCase() + source.slice(1),
-          period: group._id.period,
-          currency: group._id.currency === "UNKNOWN" ? null : group._id.currency,
-          order_count: group.order_count,
-          sales: group.sales,
-        };
-      }),
-    });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Failed to generate sales report." });
-  }
-});
-
 // ---------- Products ----------
 
 const PRODUCT_STATUSES = ["active", "draft", "archived"];
@@ -847,6 +743,97 @@ function parseProductPrice(val) {
 }
 function isChannelProductSynced(cp) {
   return !!(cp && (cp.channel_variant_id || cp.channel_product_id));
+}
+
+/**
+ * Create listing on Shopify for a UniSell product that is not yet mapped.
+ * Keeps existing Daraz source/external_id when already linked to Daraz.
+ */
+async function pushProductToShopifyForCompany(tenantDb, product, productId) {
+  if (!product?.company_id) {
+    return { warning: "No company on product — assign a company with Shopify connected." };
+  }
+  const authDb = await getAuthDb();
+  const shopifyIntegration = await authDb.collection("integrations").findOne({ slug: "shopify" });
+  if (!shopifyIntegration) {
+    return { warning: "Shopify integration is not configured on this server." };
+  }
+  const companyOid =
+    product.company_id instanceof ObjectId ? product.company_id : new ObjectId(product.company_id);
+  const ci = await tenantDb.collection("company_integrations").findOne({
+    company_id: { $in: [companyOid, companyOid.toString()] },
+    integration_id: { $in: [shopifyIntegration._id, shopifyIntegration._id.toString()] },
+    status: 1,
+    $or: [{ features: { $exists: false } }, { features: "products" }],
+  });
+  if (!ci?.credentials) {
+    return {
+      warning:
+        "Shopify is not connected for this company. Open Setup → Company Integrations and connect Shopify.",
+    };
+  }
+  const productTypeTrimmed = product.product_type != null ? String(product.product_type).trim() : "";
+  if (!productTypeTrimmed) {
+    return {
+      warning:
+        "Category is required to push to Shopify (e.g. Jewellery, T-Shirts, Mobile Accessories).",
+    };
+  }
+
+  const pushResult = await ShopifyIntegration.createProduct(ci.credentials, {
+    title: product.title,
+    description: product.description,
+    product_type: product.product_type,
+    status: product.status,
+    handle: product.handle,
+    sku: product.sku,
+    price: product.price,
+    price_old: product.price_old,
+    page_title: product.page_title,
+    tags: product.tags,
+    vendor: product.vendor,
+    images: product.images,
+    sizes: product.sizes,
+    variants: product.variants,
+  });
+  if (!pushResult?.external_id) {
+    return { warning: "Shopify did not return a product id." };
+  }
+
+  const pid = productId instanceof ObjectId ? productId : new ObjectId(productId);
+  const productsColl = tenantDb.collection("products");
+  const cpColl = tenantDb.collection("channel_products");
+  const darazCp = await cpColl.findOne({ product_id: pid, channel_name: "daraz" });
+  const keepDarazSource = isChannelProductSynced(darazCp) || product.source === "daraz";
+
+  const productSet = {
+    status: "active",
+    updated_at: new Date(),
+  };
+  // Don't overwrite Daraz identity when this product already lives on Daraz.
+  if (!keepDarazSource) {
+    productSet.external_id = pushResult.external_id;
+    productSet.source = "shopify";
+  }
+
+  await productsColl.updateOne({ _id: pid }, { $set: productSet });
+  await cpColl.updateOne(
+    { product_id: pid, channel_name: "shopify" },
+    {
+      $set: {
+        channel_product_id: pushResult.channel_product_id || pushResult.external_id,
+        channel_variant_id: pushResult.channel_variant_id || null,
+        channel_inventory_item_id: pushResult.channel_inventory_item_id || null,
+        updated_at: new Date(),
+      },
+    },
+    { upsert: true }
+  );
+
+  return {
+    shopifyPush: pushResult,
+    categoryWarning: pushResult.categoryWarning || null,
+  };
 }
 
 function channelProductsLookupMap(cpDocs) {
@@ -944,15 +931,6 @@ router.get("/products", async (req, res) => {
         const daraz_synced = isChannelProductSynced(cpByProduct.get(`${pid}:daraz`));
         const quantity = inv && typeof inv.quantity === "number" ? inv.quantity : 0;
         const allocated = inv && typeof inv.allocated === "number" ? inv.allocated : 0;
-        const rawImages = Array.isArray(p.raw?.images)
-          ? p.raw.images
-          : p.raw?.image
-            ? [p.raw.image]
-            : [];
-        const productImages = Array.isArray(p.images) && p.images.length > 0 ? p.images : rawImages;
-        const images = productImages
-          .map((image) => typeof image === "string" ? image : image?.src || image?.url)
-          .filter(Boolean);
         return {
           id: p._id.toString(),
           company_id: p.company_id ? p.company_id.toString() : null,
@@ -973,7 +951,7 @@ router.get("/products", async (req, res) => {
           meta_description: p.meta_description || undefined,
           handle: p.handle || undefined,
           description: p.description || undefined,
-          images,
+          images: Array.isArray(p.images) ? p.images : undefined,
           tags: Array.isArray(p.tags) ? p.tags : undefined,
           vendor: p.vendor || undefined,
           integration_slugs: Array.isArray(p.integration_slugs) ? p.integration_slugs : [],
@@ -1096,7 +1074,9 @@ router.post("/products", async (req, res) => {
             return Number.isNaN(n) || n < 0 ? null : Math.floor(n);
           })()
         : null;
-    const variants = Array.isArray(variantsBody)
+    const skuTrimmed = sku != null ? String(sku).trim() : "";
+    const productTypeTrimmed = product_type != null ? String(product_type).trim() : "";
+    let variants = Array.isArray(variantsBody)
       ? variantsBody.map((v) => ({
           id: v?.id != null ? String(v.id) : undefined,
           sku: v?.sku != null ? String(v.sku).trim() : undefined,
@@ -1113,13 +1093,76 @@ router.post("/products", async (req, res) => {
                 : undefined,
         }))
       : [];
+    // Keep product-level SKU and first-variant SKU in sync (Shopify + Daraz both need it).
+    if (skuTrimmed) {
+      if (variants.length === 0) {
+        variants = [
+          {
+            sku: skuTrimmed,
+            title: "Default",
+            price: parseProductPrice(price),
+            inventory_quantity: initialQty != null ? initialQty : undefined,
+          },
+        ];
+      } else if (!String(variants[0]?.sku || "").trim()) {
+        variants[0] = { ...variants[0], sku: skuTrimmed };
+      }
+    } else if (variants[0] && String(variants[0].sku || "").trim()) {
+      // fall through — product sku filled from variant below
+    }
+    const effectiveSku = skuTrimmed || String(variants[0]?.sku || "").trim();
+
+    const integrationSlugs = Array.isArray(integrationSlugsBody)
+      ? integrationSlugsBody.filter((s) => s && String(s).trim()).map((s) => String(s).trim())
+      : [];
+    const pushToShopify = integrationSlugs.length === 0 || integrationSlugs.includes("shopify");
+    const pushToDaraz = integrationSlugs.length === 0 || integrationSlugs.includes("daraz");
+
+    const authDb = await getAuthDb();
+    const integrationsColl = authDb.collection("integrations");
+    const companyIntegrationsColl = tenantDb.collection("company_integrations");
+    let companyHasShopify = false;
+    let companyHasDaraz = false;
+    if (company_id) {
+      const companyOid = company_id instanceof ObjectId ? company_id : new ObjectId(company_id);
+      const shopifyIntegration = await integrationsColl.findOne({ slug: "shopify" });
+      const darazIntegration = await integrationsColl.findOne({ slug: "daraz" });
+      if (shopifyIntegration && pushToShopify) {
+        companyHasShopify = !!(await companyIntegrationsColl.findOne({
+          company_id: { $in: [companyOid, companyOid.toString()] },
+          integration_id: { $in: [shopifyIntegration._id, shopifyIntegration._id.toString()] },
+          status: 1,
+        }));
+      }
+      if (darazIntegration && pushToDaraz) {
+        companyHasDaraz = !!(await companyIntegrationsColl.findOne({
+          company_id: { $in: [companyOid, companyOid.toString()] },
+          integration_id: { $in: [darazIntegration._id, darazIntegration._id.toString()] },
+          status: 1,
+        }));
+      }
+    }
+
+    const willPublish = companyHasShopify || companyHasDaraz;
+    if (willPublish && !productTypeTrimmed) {
+      return res.status(400).json({
+        error:
+          "Category is required when publishing to Shopify/Daraz (e.g. Jewellery, T-Shirts, Mobile Accessories).",
+      });
+    }
+    if (willPublish && !effectiveSku) {
+      return res.status(400).json({
+        error: "SKU is required when publishing to Shopify/Daraz (used as Seller SKU on Daraz).",
+      });
+    }
+
     const now = new Date();
     const doc = {
       company_id,
       external_id: null,
       title: titleTrimmed,
-      sku: sku != null ? String(sku).trim() : "",
-      product_type: product_type != null ? String(product_type).trim() : "",
+      sku: effectiveSku,
+      product_type: productTypeTrimmed,
       status: normalizeProductStatus(status),
       price: parseProductPrice(price),
       price_old: parseProductPrice(price_old),
@@ -1134,7 +1177,7 @@ router.post("/products", async (req, res) => {
       images: Array.isArray(images) ? images : undefined,
       tags: Array.isArray(tags) ? tags : undefined,
       vendor: vendor != null ? String(vendor).trim() : undefined,
-      integration_slugs: Array.isArray(integrationSlugsBody) ? integrationSlugsBody.filter((s) => s && String(s).trim()) : [],
+      integration_slugs: integrationSlugs,
       variants,
       variant_count: variants.length,
       created_at: now,
@@ -1143,22 +1186,30 @@ router.post("/products", async (req, res) => {
     const result = await productsColl.insertOne(doc);
     const created = { ...doc, _id: result.insertedId };
     await ensureInventoryForProduct(tenantDb, result.insertedId);
+
+    // Stock must exist before channel create/push so Daraz SellerSku qty and Shopify inventory are correct.
+    let savedQty = null;
+    if (initialQty != null) {
+      const invUpdated = await updateInventoryQuantity(tenantDb, result.insertedId, initialQty, {
+        tenantName,
+      });
+      savedQty = invUpdated?.quantity ?? initialQty;
+    }
+
     let company_name = null;
     if (created.company_id) {
       const company = await companiesColl.findOne({ _id: created.company_id });
       company_name = company?.name || null;
     }
 
-    // If product is linked to a company with Shopify and is enabled for Shopify, push to store
-    const integrationSlugs = Array.isArray(created.integration_slugs) ? created.integration_slugs : [];
-    const pushToShopify = integrationSlugs.length === 0 || integrationSlugs.includes("shopify");
-    const pushToDaraz = integrationSlugs.length === 0 || integrationSlugs.includes("daraz");
     let external_id = created.external_id || null;
     let productSource = created.source || "local";
-    const authDb = await getAuthDb();
-    const integrationsColl = authDb.collection("integrations");
-    const companyIntegrationsColl = tenantDb.collection("company_integrations");
-    if (created.company_id && pushToShopify) {
+    let shopifySynced = false;
+    let darazSynced = false;
+    created._shopifySyncWarning = null;
+    created._darazSyncWarning = null;
+
+    if (created.company_id && companyHasShopify) {
       const shopifyIntegration = await integrationsColl.findOne({ slug: "shopify" });
       if (shopifyIntegration) {
         const companyOid = created.company_id instanceof ObjectId ? created.company_id : new ObjectId(created.company_id);
@@ -1189,6 +1240,7 @@ router.post("/products", async (req, res) => {
             if (pushResult?.external_id) {
               external_id = pushResult.external_id;
               productSource = "shopify";
+              shopifySynced = true;
               await productsColl.updateOne(
                 { _id: result.insertedId },
                 { $set: { external_id: pushResult.external_id, source: "shopify", status: "active", updated_at: new Date() } }
@@ -1212,42 +1264,39 @@ router.post("/products", async (req, res) => {
             }
           } catch (pushErr) {
             console.error("[Shopify] Push product after create failed:", pushErr.message);
+            created._shopifySyncWarning = pushErr.message || "Shopify product sync failed.";
           }
         }
       }
     }
 
-    if (created.company_id && pushToDaraz) {
+    if (created.company_id && companyHasDaraz) {
       const darazRes = await pushProductToDarazForCompany(
         tenantDb,
-        created,
+        { ...created, sku: effectiveSku, product_type: productTypeTrimmed, quantity: savedQty ?? 0 },
         result.insertedId,
         { integrationSlugs }
       );
       if (darazRes.warning) {
         created._darazSyncWarning = darazRes.warning;
       } else if (darazRes.darazPush?.channel_product_id) {
-        external_id = darazRes.darazPush.channel_product_id;
+        darazSynced = true;
+        if (!external_id) external_id = darazRes.darazPush.channel_product_id;
         if (productSource !== "shopify") productSource = "daraz";
       }
     } else if (pushToDaraz && !created.company_id) {
       created._darazSyncWarning =
-        "Product saved locally only. Select a company with Daraz connected to sync to Daraz.";
+        "Product saved locally only. Select a company with Daraz/Shopify connected to sync.";
     }
 
-    let savedQty = null;
-    if (initialQty != null) {
-      const invUpdated = await updateInventoryQuantity(tenantDb, result.insertedId, initialQty, {
-        tenantName,
-      });
-      savedQty = invUpdated?.quantity ?? initialQty;
+    if (savedQty != null) {
       const pFresh = await productsColl.findOne({ _id: result.insertedId });
       if (pFresh) {
         await syncProductInventoryToChannels(tenantDb, pFresh, savedQty);
       }
     }
 
-    const responseStatus = productSource === "shopify" ? "active" : created.status;
+    const responseStatus = shopifySynced || darazSynced ? "active" : created.status;
     const resBody = {
       id: result.insertedId.toString(),
       company_id: created.company_id ? created.company_id.toString() : null,
@@ -1261,12 +1310,15 @@ router.post("/products", async (req, res) => {
       price_old: created.price_old,
       source: productSource,
       integration_slugs: created.integration_slugs || [],
+      shopify_synced: shopifySynced,
+      daraz_synced: darazSynced,
       variants: created.variants,
       variant_count: created.variant_count,
       created_at: created.created_at,
       updated_at: created.updated_at,
     };
     if (created._categoryWarning) resBody.category_warning = created._categoryWarning;
+    if (created._shopifySyncWarning) resBody.shopify_sync_warning = created._shopifySyncWarning;
     if (created._darazSyncWarning) resBody.daraz_sync_warning = created._darazSyncWarning;
     if (savedQty != null) resBody.quantity = savedQty;
     return res.status(201).json(resBody);
@@ -1380,15 +1432,36 @@ router.put("/products/:id", async (req, res) => {
     }
     const cpColl = tenantDb.collection("channel_products");
     let daraz_sync_warning = null;
+    let shopify_sync_warning = null;
+    let category_warning = null;
     const integrationSlugs = Array.isArray(p.integration_slugs) ? p.integration_slugs : [];
     const pushToDaraz =
       integrationSlugs.length === 0 || integrationSlugs.includes("daraz");
+    const pushToShopify =
+      integrationSlugs.length === 0 || integrationSlugs.includes("shopify");
+
     const darazCpBefore = await cpColl.findOne({ product_id: oid, channel_name: "daraz" });
+    const shopifyCpBefore = await cpColl.findOne({ product_id: oid, channel_name: "shopify" });
     const darazWasSynced = isChannelProductSynced(darazCpBefore);
+    const shopifyWasSynced = isChannelProductSynced(shopifyCpBefore);
+
+    // Daraz-imported products: enabling Shopify (or All platforms) creates the Shopify listing on save.
+    if (pushToShopify && p.company_id && !shopifyWasSynced) {
+      try {
+        const shopifyRes = await pushProductToShopifyForCompany(tenantDb, p, oid);
+        if (shopifyRes.warning) shopify_sync_warning = shopifyRes.warning;
+        if (shopifyRes.categoryWarning) category_warning = shopifyRes.categoryWarning;
+      } catch (err) {
+        console.error("[Shopify] Push on product update failed:", err.message);
+        shopify_sync_warning = err.message || "Shopify product sync failed.";
+      }
+    }
+
     if (pushToDaraz && p.company_id && !darazWasSynced) {
       const darazRes = await pushProductToDarazForCompany(tenantDb, p, oid, { integrationSlugs });
       if (darazRes.warning) daraz_sync_warning = darazRes.warning;
     }
+
     const cpDaraz = await cpColl.findOne({ product_id: oid, channel_name: "daraz" });
     const cpShopify = await cpColl.findOne({ product_id: oid, channel_name: "shopify" });
     const pAfter = await coll.findOne({ _id: oid });
@@ -1418,6 +1491,8 @@ router.put("/products/:id", async (req, res) => {
       updated_at: pAfter.updated_at,
     };
     if (daraz_sync_warning) body.daraz_sync_warning = daraz_sync_warning;
+    if (shopify_sync_warning) body.shopify_sync_warning = shopify_sync_warning;
+    if (category_warning) body.category_warning = category_warning;
     return res.json(body);
   } catch (err) {
     console.error(err);
@@ -1472,48 +1547,37 @@ router.post("/products/:id/push-to-shopify", async (req, res) => {
         id: p._id.toString(),
       });
     }
-    const pushResult = await ShopifyIntegration.createProduct(ci.credentials, {
-      title: p.title,
-      description: p.description,
-      product_type: p.product_type,
-      status: p.status,
-      handle: p.handle,
-      sku: p.sku,
-      price: p.price,
-      price_old: p.price_old,
-      page_title: p.page_title,
-      tags: p.tags,
-      vendor: p.vendor,
-      images: p.images,
-      sizes: p.sizes,
-      variants: p.variants,
-    });
-    if (!pushResult?.external_id) {
-      return res.status(500).json({ error: "Shopify did not return product id" });
-    }
-    await productsColl.updateOne(
-      { _id: oid },
-      { $set: { external_id: pushResult.external_id, source: "shopify", status: "active", updated_at: new Date() } }
-    );
     const cpColl = tenantDb.collection("channel_products");
-    await cpColl.updateOne(
-      { product_id: oid, channel_name: "shopify" },
-      {
-        $set: {
-          channel_product_id: pushResult.channel_product_id || pushResult.external_id,
-          channel_variant_id: pushResult.channel_variant_id || null,
-          channel_inventory_item_id: pushResult.channel_inventory_item_id || null,
-          updated_at: new Date(),
-        },
-      },
-      { upsert: true }
-    );
+    const existingShopify = await cpColl.findOne({ product_id: oid, channel_name: "shopify" });
+    if (isChannelProductSynced(existingShopify)) {
+      return res.status(200).json({
+        message: "Product is already linked to Shopify.",
+        id: p._id.toString(),
+        shopify_synced: true,
+        daraz_synced: isChannelProductSynced(
+          await cpColl.findOne({ product_id: oid, channel_name: "daraz" })
+        ),
+      });
+    }
+
+    let shopifyRes;
+    try {
+      shopifyRes = await pushProductToShopifyForCompany(tenantDb, p, oid);
+    } catch (err) {
+      return res.status(400).json({ error: err.message || "Push to Shopify failed." });
+    }
+    if (shopifyRes.warning) {
+      return res.status(400).json({ error: shopifyRes.warning });
+    }
+
     const updated = await productsColl.findOne({ _id: oid });
     let company_name = null;
     if (updated.company_id) {
       const company = await tenantDb.collection("companies").findOne({ _id: updated.company_id });
       company_name = company?.name || null;
     }
+    const cpDaraz = await cpColl.findOne({ product_id: oid, channel_name: "daraz" });
+    const cpShopify = await cpColl.findOne({ product_id: oid, channel_name: "shopify" });
     const resBody = {
       id: updated._id.toString(),
       company_id: updated.company_id ? updated.company_id.toString() : null,
@@ -1525,12 +1589,15 @@ router.post("/products/:id/push-to-shopify", async (req, res) => {
       status: updated.status,
       price: updated.price,
       source: updated.source,
+      shopify_synced: isChannelProductSynced(cpShopify),
+      daraz_synced: isChannelProductSynced(cpDaraz),
       variants: updated.variants || [],
       variant_count: Array.isArray(updated.variants) ? updated.variants.length : 0,
       created_at: updated.created_at,
       updated_at: updated.updated_at,
+      message: "Product created on Shopify and linked for inventory sync.",
     };
-    if (pushResult.categoryWarning) resBody.category_warning = pushResult.categoryWarning;
+    if (shopifyRes.categoryWarning) resBody.category_warning = shopifyRes.categoryWarning;
     return res.json(resBody);
   } catch (err) {
     console.error(err);
