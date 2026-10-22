@@ -1,10 +1,6 @@
 import {
-  createCipheriv,
-  createDecipheriv,
   createHash,
-  createHmac,
   randomBytes,
-  timingSafeEqual,
 } from "node:crypto";
 import nodemailer from "nodemailer";
 import { config } from "../config.js";
@@ -63,92 +59,6 @@ function getTransporter() {
 
 export async function sendAccountEmail({ to, subject, text, html }) {
   await getTransporter().sendMail({ from: config.mailFrom, to, subject, text, html });
-}
-
-function base32Encode(buffer) {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-  let bits = 0;
-  let value = 0;
-  let output = "";
-  for (const byte of buffer) {
-    value = (value << 8) | byte;
-    bits += 8;
-    while (bits >= 5) {
-      output += alphabet[(value >>> (bits - 5)) & 31];
-      bits -= 5;
-    }
-  }
-  if (bits > 0) output += alphabet[(value << (5 - bits)) & 31];
-  return output;
-}
-
-function base32Decode(value) {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-  let bits = 0;
-  let current = 0;
-  const output = [];
-  for (const char of value.toUpperCase().replace(/=+$/g, "")) {
-    const index = alphabet.indexOf(char);
-    if (index < 0) throw new Error("Invalid authenticator secret");
-    current = (current << 5) | index;
-    bits += 5;
-    if (bits >= 8) {
-      output.push((current >>> (bits - 8)) & 255);
-      bits -= 8;
-    }
-  }
-  return Buffer.from(output);
-}
-
-export function createTotpSecret() {
-  return base32Encode(randomBytes(20));
-}
-
-function totp(secret, counter) {
-  const counterBuffer = Buffer.alloc(8);
-  counterBuffer.writeBigUInt64BE(BigInt(counter));
-  const digest = createHmac("sha1", base32Decode(secret)).update(counterBuffer).digest();
-  const offset = digest[digest.length - 1] & 0x0f;
-  const binary = digest.readUInt32BE(offset) & 0x7fffffff;
-  return String(binary % 1_000_000).padStart(6, "0");
-}
-
-export function totpCounterForCode(secret, code, now = Date.now()) {
-  if (typeof code !== "string" || !/^\d{6}$/.test(code)) return null;
-  const counter = Math.floor(now / 30_000);
-  for (let drift = -1; drift <= 1; drift += 1) {
-    const expected = Buffer.from(totp(secret, counter + drift));
-    const supplied = Buffer.from(code);
-    if (expected.length === supplied.length && timingSafeEqual(expected, supplied)) return counter + drift;
-  }
-  return null;
-}
-
-export function verifyTotp(secret, code, now = Date.now()) {
-  return totpCounterForCode(secret, code, now) !== null;
-}
-
-const encryptionKey = () => createHash("sha256").update(config.jwtSecret).digest();
-
-export function encryptSecret(secret) {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", encryptionKey(), iv);
-  const encrypted = Buffer.concat([cipher.update(secret, "utf8"), cipher.final()]);
-  return `${iv.toString("hex")}:${cipher.getAuthTag().toString("hex")}:${encrypted.toString("hex")}`;
-}
-
-export function decryptSecret(value) {
-  const [ivHex, tagHex, dataHex] = String(value || "").split(":");
-  if (!ivHex || !tagHex || !dataHex) throw new Error("Invalid encrypted authenticator secret");
-  const decipher = createDecipheriv("aes-256-gcm", encryptionKey(), Buffer.from(ivHex, "hex"));
-  decipher.setAuthTag(Buffer.from(tagHex, "hex"));
-  return Buffer.concat([decipher.update(Buffer.from(dataHex, "hex")), decipher.final()]).toString("utf8");
-}
-
-export function authenticatorUri(secret, email) {
-  const label = encodeURIComponent(`UniSell:${email}`);
-  const issuer = encodeURIComponent("UniSell");
-  return `otpauth://totp/${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`;
 }
 
 export function passwordFeedback(password) {

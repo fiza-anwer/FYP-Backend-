@@ -1,6 +1,5 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
 import { ObjectId } from "mongodb";
 import { getAuthDb } from "../db/authDb.js";
 import { getTenantDb } from "../db/tenantDb.js";
@@ -13,45 +12,15 @@ import {
   hashToken,
   sendAccountEmail,
   passwordFeedback,
-  createTotpSecret,
-  authenticatorUri,
-  encryptSecret,
-  decryptSecret,
-  verifyTotp,
-  totpCounterForCode,
 } from "../services/accountSecurityService.js";
 
 const router = Router();
 const PASSWORD_ATTEMPT_LIMIT = 5;
 const PASSWORD_ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
-const TRUSTED_DEVICE_COOKIE = "unisell_trusted_device";
-const TRUSTED_DEVICE_DURATION_MS = 180 * 24 * 60 * 60 * 1000;
 const SUPPORT_UPLOAD_MAX_BYTES = 5 * 1024 * 1024;
 const SUPPORT_CATEGORIES = new Set(["Account", "Product", "Order", "Integration", "Other"]);
 const SUPPORT_PRIORITIES = new Set(["Low", "Normal", "High", "Urgent"]);
 const SUPPORT_ATTACHMENT_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "application/pdf"]);
-
-function trustedDeviceCookieOptions(maxAge) {
-  const secure = process.env.NODE_ENV === "production";
-  return {
-    httpOnly: true,
-    secure,
-    sameSite: secure ? "none" : "lax",
-    path: "/api/auth",
-    maxAge,
-  };
-}
-
-async function isTrustedDevice(db, req, userKey) {
-  const token = req.cookies?.[TRUSTED_DEVICE_COOKIE];
-  if (!token) return false;
-  const record = await db.collection("auth_trusted_devices").findOne({
-    _id: hashToken(token),
-    user_key: userKey,
-    expires_at: { $gt: new Date() },
-  });
-  return Boolean(record);
-}
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (character) => ({
@@ -229,14 +198,6 @@ router.post("/login", async (req, res) => {
         return res.status(401).json({ error: "Invalid email or password" });
       }
       const userKey = `superadmin:${superadmin._id}`;
-      if (superadmin.two_factor_enabled && !(await isTrustedDevice(db, req, userKey))) {
-        const challengeToken = jwt.sign(
-          { email: em, role: "superadmin", purpose: "login_2fa" },
-          config.jwtSecret,
-          { expiresIn: "5m" }
-        );
-        return res.json({ requires_two_factor: true, challenge_token: challengeToken });
-      }
       const session = await createAuthenticatedSession(db, req, userKey, { email: em, role: "superadmin" });
       await superadminsCol.updateOne({ _id: superadmin._id }, { $set: { last_login_at: new Date() } });
       return res.json({
@@ -270,14 +231,6 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password" });
     }
     const userKey = `tenant:${tenant.tenant_name}:${tenantUser._id}`;
-    if (tenantUser.two_factor_enabled && !(await isTrustedDevice(db, req, userKey))) {
-      const challengeToken = jwt.sign(
-        { email: em, role: "tenant", tenant_name: tenant.tenant_name, purpose: "login_2fa" },
-        config.jwtSecret,
-        { expiresIn: "5m" }
-      );
-      return res.json({ requires_two_factor: true, challenge_token: challengeToken });
-    }
     const session = await createAuthenticatedSession(db, req, userKey, {
       email: em,
       role: "tenant",
@@ -309,221 +262,6 @@ router.post("/login", async (req, res) => {
   } catch (err) {
     console.error("Login error:", err);
     return res.status(500).json({ error: "Login failed" });
-  }
-});
-
-router.post("/two-factor/login", async (req, res) => {
-  try {
-    const challenge = jwt.verify(String(req.body?.challenge_token || ""), config.jwtSecret);
-    if (challenge.purpose !== "login_2fa") return res.status(401).json({ error: "Invalid sign-in challenge" });
-    const db = await getAuthDb();
-    let account;
-    let tenant;
-    let tenantDb;
-    let collection;
-    if (challenge.role === "superadmin") {
-      collection = db.collection("superadmins");
-      account = await collection.findOne({
-        $or: [{ email: challenge.email }, { username: challenge.email }],
-      });
-    } else if (challenge.role === "tenant" && challenge.tenant_name) {
-      tenant = await db.collection("tenants").findOne({
-        tenant_name: challenge.tenant_name,
-        email: challenge.email,
-        status: "approved",
-      });
-      if (tenant) {
-        tenantDb = await getTenantDb(tenant.tenant_name);
-        collection = tenantDb.collection("users");
-        account = await collection.findOne({ email: challenge.email });
-      }
-    }
-    if (!account?.two_factor_enabled || !account.two_factor_secret) {
-      return res.status(401).json({ error: "Two-factor authentication is not enabled for this account" });
-    }
-    const userKey = challenge.role === "superadmin"
-      ? `superadmin:${account._id}`
-      : `tenant:${tenant.tenant_name}:${account._id}`;
-    const attemptKey = hashToken(`2fa:${userKey}`);
-    if (await passwordAttemptCount(db, attemptKey) >= PASSWORD_ATTEMPT_LIMIT) {
-      return res.status(429).json({ error: "Too many incorrect verification codes. Try again in 15 minutes." });
-    }
-    const codeCounter = totpCounterForCode(decryptSecret(account.two_factor_secret), String(req.body?.code || ""));
-    if (codeCounter === null) {
-      await recordPasswordFailure(db, attemptKey);
-      return res.status(401).json({ error: "Invalid verification code" });
-    }
-    const consumeCode = await collection.updateOne(
-      {
-        _id: account._id,
-        $or: [
-          { two_factor_last_counter: { $lt: codeCounter } },
-          { two_factor_last_counter: { $exists: false } },
-        ],
-      },
-      { $set: { two_factor_last_counter: codeCounter } }
-    );
-    if (consumeCode.matchedCount === 0) {
-      await recordPasswordFailure(db, attemptKey);
-      return res.status(401).json({ error: "This verification code has already been used" });
-    }
-    await db.collection("security_attempts").deleteOne({ _id: attemptKey });
-    const trustedDeviceToken = createToken();
-    const trustedDeviceCreatedAt = new Date();
-    await db.collection("auth_trusted_devices").insertOne({
-      _id: hashToken(trustedDeviceToken),
-      user_key: userKey,
-      created_at: trustedDeviceCreatedAt,
-      expires_at: new Date(trustedDeviceCreatedAt.getTime() + TRUSTED_DEVICE_DURATION_MS),
-      user_agent: String(req.get("user-agent") || "Unknown device").slice(0, 300),
-    });
-    res.cookie(
-      TRUSTED_DEVICE_COOKIE,
-      trustedDeviceToken,
-      trustedDeviceCookieOptions(TRUSTED_DEVICE_DURATION_MS)
-    );
-    const session = await createAuthenticatedSession(db, req, userKey, {
-      email: challenge.email,
-      role: challenge.role,
-      ...(tenant ? { tenant_name: tenant.tenant_name } : {}),
-    });
-    const lastLoginAt = new Date();
-    await collection.updateOne({ _id: account._id }, { $set: { last_login_at: lastLoginAt } });
-    const user = {
-      email: challenge.email,
-      name: account.name || tenant?.tenant_name || account.username || challenge.email,
-      avatar: account.avatar || "",
-      role: challenge.role,
-      member_since: account.created_at || tenant?.created_at || null,
-      last_login_at: lastLoginAt,
-      email_verified: account.email_verified === true,
-      isSuperadmin: challenge.role === "superadmin",
-      ...(tenant ? { tenant_name: tenant.tenant_name } : {}),
-    };
-    let stock_alerts;
-    if (tenantDb) {
-      try {
-        stock_alerts = await getStockAlertSummaryForTenant(tenantDb);
-      } catch (alertErr) {
-        console.warn("[Two-factor login] stock alerts:", alertErr.message);
-      }
-    }
-    return res.json({ token: session.token, user, stock_alerts });
-  } catch (err) {
-    if (err.name === "JsonWebTokenError" || err.name === "TokenExpiredError") {
-      return res.status(401).json({ error: "Sign-in challenge expired. Please sign in again." });
-    }
-    console.error("Two-factor sign-in error:", err);
-    return res.status(500).json({ error: "Two-factor sign-in failed" });
-  }
-});
-
-router.post("/two-factor/setup", authMiddleware, async (req, res) => {
-  try {
-    const db = await getAuthDb();
-    const accountData = await findAccountByUserKey(db, req.user.sub);
-    if (!accountData) return res.status(404).json({ error: "Account not found" });
-    if (accountData.account.two_factor_enabled) {
-      return res.status(409).json({ error: "Two-factor authentication is already enabled" });
-    }
-    const secret = createTotpSecret();
-    await accountData.collection.updateOne(
-      { _id: accountData.account._id },
-      {
-        $set: {
-          two_factor_setup_secret: encryptSecret(secret),
-          two_factor_setup_expires_at: new Date(Date.now() + 10 * 60 * 1000),
-        },
-      }
-    );
-    return res.json({
-      secret,
-      otpauth_url: authenticatorUri(secret, accountData.account.email || req.user.email),
-    });
-  } catch (err) {
-    console.error("Two-factor setup error:", err);
-    return res.status(500).json({ error: "Unable to start two-factor setup" });
-  }
-});
-
-router.post("/two-factor/enable", authMiddleware, async (req, res) => {
-  try {
-    const db = await getAuthDb();
-    const accountData = await findAccountByUserKey(db, req.user.sub);
-    if (!accountData) return res.status(404).json({ error: "Account not found" });
-    const account = accountData.account;
-    if (
-      !account.two_factor_setup_secret ||
-      !account.two_factor_setup_expires_at ||
-      account.two_factor_setup_expires_at <= new Date()
-    ) {
-      return res.status(400).json({ error: "Two-factor setup expired. Start setup again." });
-    }
-    const secret = decryptSecret(account.two_factor_setup_secret);
-    const codeCounter = totpCounterForCode(secret, String(req.body?.code || ""));
-    if (codeCounter === null) {
-      return res.status(400).json({ error: "Invalid authenticator code" });
-    }
-    await accountData.collection.updateOne(
-      { _id: account._id },
-      {
-        $set: {
-          two_factor_enabled: true,
-          two_factor_secret: account.two_factor_setup_secret,
-          two_factor_last_counter: codeCounter,
-        },
-        $unset: { two_factor_setup_secret: "", two_factor_setup_expires_at: "" },
-      }
-    );
-    await db.collection("auth_trusted_devices").deleteMany({
-      user_key: req.user.sub,
-    });
-    return res.json({ message: "Two-factor authentication enabled." });
-  } catch (err) {
-    console.error("Enable two-factor error:", err);
-    return res.status(500).json({ error: "Unable to enable two-factor authentication" });
-  }
-});
-
-router.post("/two-factor/disable", authMiddleware, async (req, res) => {
-  try {
-    const db = await getAuthDb();
-    const accountData = await findAccountByUserKey(db, req.user.sub);
-    if (!accountData) return res.status(404).json({ error: "Account not found" });
-    const { account, collection } = accountData;
-    const attemptKey = hashToken(`2fa-disable:${req.user.sub}`);
-    if (await passwordAttemptCount(db, attemptKey) >= PASSWORD_ATTEMPT_LIMIT) {
-      return res.status(429).json({ error: "Too many incorrect attempts. Try again in 15 minutes." });
-    }
-    const hash = account.password_hash || account.password;
-    const passwordValid = typeof hash === "string" && (
-      hash.startsWith("$2") ? bcrypt.compareSync(String(req.body?.current_password || ""), hash)
-        : hash === String(req.body?.current_password || "")
-    );
-    const codeValid = account.two_factor_secret &&
-      verifyTotp(decryptSecret(account.two_factor_secret), String(req.body?.code || ""));
-    if (!passwordValid || !codeValid) {
-      await recordPasswordFailure(db, attemptKey);
-      return res.status(400).json({ error: "Current password or authenticator code is incorrect" });
-    }
-    await db.collection("security_attempts").deleteOne({ _id: attemptKey });
-    await db.collection("auth_trusted_devices").deleteMany({ user_key: req.user.sub });
-    res.clearCookie(TRUSTED_DEVICE_COOKIE, trustedDeviceCookieOptions(0));
-    await collection.updateOne(
-      { _id: account._id },
-      {
-        $set: { two_factor_enabled: false },
-        $unset: {
-          two_factor_secret: "",
-          two_factor_setup_secret: "",
-          two_factor_last_counter: "",
-        },
-      }
-    );
-    return res.json({ message: "Two-factor authentication disabled." });
-  } catch (err) {
-    console.error("Disable two-factor error:", err);
-    return res.status(500).json({ error: "Unable to disable two-factor authentication" });
   }
 });
 
@@ -1146,7 +884,6 @@ router.get("/profile", authMiddleware, async (req, res) => {
           member_since: account.created_at || null,
           last_login_at: account.last_login_at || null,
           email_verified: account.email_verified === true,
-          two_factor_enabled: account.two_factor_enabled === true,
           pending_email: pendingEmail?.new_email || "",
         },
       });
@@ -1178,7 +915,6 @@ router.get("/profile", authMiddleware, async (req, res) => {
         member_since: account.created_at || tenant.created_at || null,
         last_login_at: account.last_login_at || null,
         email_verified: account.email_verified === true,
-        two_factor_enabled: account.two_factor_enabled === true,
         pending_email: pendingEmail?.new_email || "",
       },
     });
@@ -1397,7 +1133,6 @@ router.patch("/profile", authMiddleware, async (req, res) => {
         avatar: avatar !== undefined ? avatar || "" : account.avatar || "",
         role: superadmin ? "superadmin" : account.role || "tenant",
         email_verified: account.email_verified === true,
-        two_factor_enabled: account.two_factor_enabled === true,
         member_since: account.created_at || tenant?.created_at || null,
         last_login_at: account.last_login_at || null,
         pending_email: currentPendingEmail,
