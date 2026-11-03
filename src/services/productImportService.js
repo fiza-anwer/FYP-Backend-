@@ -6,6 +6,9 @@ import { onInventoryQuantityChanged } from "./stockAlertService.js";
 import { ShopifyIntegration } from "../integrations/Shopify.js";
 import { DarazIntegration } from "../integrations/Daraz.js";
 import { normalizeSku } from "../utils/productTextFormatting.js";
+import { forEachConcurrent } from "./forEachConcurrent.js";
+
+const MAX_CONCURRENT_PRODUCT_PUSHES = 3;
 
 const INTEGRATION_CLASSES = {
   shopify: ShopifyIntegration,
@@ -298,16 +301,16 @@ export async function runPushPendingProductsForTenant(tenantName) {
   let pushed = 0;
   const errors = [];
 
-  for (const p of pending) {
+  await forEachConcurrent(pending, MAX_CONCURRENT_PRODUCT_PUSHES, async (p) => {
     const productTypeTrimmed = p.product_type != null ? String(p.product_type).trim() : "";
-    if (!productTypeTrimmed) continue;
+    if (!productTypeTrimmed) return;
 
     const companyOid = p.company_id instanceof ObjectId ? p.company_id : new ObjectId(p.company_id);
     const ci = activeCis.find(
       (c) =>
         (c.company_id instanceof ObjectId ? c.company_id : new ObjectId(c.company_id)).equals(companyOid) && c.credentials
     );
-    if (!ci) continue;
+    if (!ci) return;
 
     try {
       const pushResult = await ShopifyIntegration.createProduct(ci.credentials, {
@@ -328,7 +331,7 @@ export async function runPushPendingProductsForTenant(tenantName) {
       });
       if (!pushResult?.external_id) {
         errors.push({ product_id: p._id.toString(), error: "Shopify did not return product id" });
-        continue;
+        return;
       }
       await productsColl.updateOne(
         { _id: p._id },
@@ -350,7 +353,7 @@ export async function runPushPendingProductsForTenant(tenantName) {
     } catch (err) {
       errors.push({ product_id: p._id.toString(), error: err.message || String(err) });
     }
-  }
+  });
 
   return { pushed, errors };
 }
@@ -389,32 +392,69 @@ export async function runPushPendingProductsToDarazForTenant(tenantName) {
     .limit(500)
     .toArray();
 
+  const productIds = products.map((product) => product._id);
+  const [channelMappings, inventory] = await Promise.all([
+    channelProductsColl
+      .find({ product_id: { $in: productIds }, channel_name: "daraz" })
+      .toArray(),
+    inventoryColl.find({ product_id: { $in: productIds } }).toArray(),
+  ]);
+  const mappingsByProductId = new Map(
+    channelMappings.map((mapping) => [mapping.product_id.toString(), mapping])
+  );
+  const inventoryByProductId = new Map(
+    inventory.map((item) => [item.product_id.toString(), item])
+  );
+  const companyIdsWithProducts = new Set(
+    products.map((product) => product.company_id.toString())
+  );
+  const credentialsByCiId = new Map();
+  await Promise.all(
+    activeCis
+      .filter(
+        (ci) =>
+          ci.credentials &&
+          companyIdsWithProducts.has(
+            (ci.company_id instanceof ObjectId ? ci.company_id : new ObjectId(ci.company_id)).toString()
+          )
+      )
+      .map(async (ci) => {
+        try {
+          const credentials = await DarazIntegration.ensureAccessToken(ci.credentials);
+          if (credentials.access_token !== ci.credentials?.access_token) {
+            await companyIntegrationsColl.updateOne(
+              { _id: ci._id },
+              { $set: { credentials, updated_at: new Date() } }
+            );
+          }
+          credentialsByCiId.set(ci._id.toString(), { credentials });
+        } catch (error) {
+          credentialsByCiId.set(ci._id.toString(), { error });
+        }
+      })
+  );
+
   let pushed = 0;
   const errors = [];
 
-  for (const p of products) {
+  await forEachConcurrent(products, MAX_CONCURRENT_PRODUCT_PUSHES, async (p) => {
     const sku = (p.sku || "").trim();
-    if (!sku) continue;
+    if (!sku) return;
 
     const companyOid = p.company_id instanceof ObjectId ? p.company_id : new ObjectId(p.company_id);
     const ci = activeCis.find((c) => {
       const cid = c.company_id instanceof ObjectId ? c.company_id : new ObjectId(c.company_id);
       return cid.equals(companyOid) && c.credentials;
     });
-    if (!ci) continue;
-
-    const cp =
-      (await channelProductsColl.findOne({ product_id: p._id, channel_name: "daraz" })) || {};
+    if (!ci) return;
 
     try {
-      let credentials = await DarazIntegration.ensureAccessToken(ci.credentials);
-      if (credentials.access_token !== ci.credentials?.access_token) {
-        await companyIntegrationsColl.updateOne(
-          { _id: ci._id },
-          { $set: { credentials, updated_at: new Date() } }
-        );
-      }
-      const inv = await inventoryColl.findOne({ product_id: p._id });
+      const auth = credentialsByCiId.get(ci._id.toString());
+      if (auth?.error) throw auth.error;
+      if (!auth?.credentials) throw new Error("Daraz credentials are unavailable.");
+      const credentials = auth.credentials;
+      const cp = mappingsByProductId.get(p._id.toString()) || {};
+      const inv = inventoryByProductId.get(p._id.toString());
       const qty = inv && typeof inv.quantity === "number" ? inv.quantity : 0;
 
       const darazPush = await DarazIntegration.pushProduct(
@@ -468,7 +508,7 @@ export async function runPushPendingProductsToDarazForTenant(tenantName) {
     } catch (err) {
       errors.push({ product_id: p._id.toString(), error: err.message || String(err) });
     }
-  }
+  });
 
   return { pushed, errors };
 }

@@ -3,8 +3,10 @@ import { getAuthDb } from "../db/authDb.js";
 import { getTenantDb, tenantDbExists } from "../db/tenantDb.js";
 import { ShopifyIntegration } from "../integrations/Shopify.js";
 import { DarazIntegration } from "../integrations/Daraz.js";
+import { forEachConcurrent } from "./forEachConcurrent.js";
 
 const BATCH_LIMIT = 200;
+const MAX_CONCURRENT_SYNC = 3;
 const MAX_RETRIES = 3;
 
 async function syncOneChannelMapping({
@@ -148,25 +150,44 @@ export async function syncInventoryToChannelsForTenant(tenantName) {
     .limit(BATCH_LIMIT)
     .toArray();
 
+  const productIds = [
+    ...new Map(
+      mappings.map((mapping) => {
+        const id =
+          mapping.product_id instanceof ObjectId
+            ? mapping.product_id
+            : new ObjectId(mapping.product_id);
+        return [id.toString(), id];
+      })
+    ).values(),
+  ];
+  const [products, inventory] = await Promise.all([
+    productsColl.find({ _id: { $in: productIds } }).toArray(),
+    inventoryColl.find({ product_id: { $in: productIds } }).toArray(),
+  ]);
+  const productsById = new Map(products.map((product) => [product._id.toString(), product]));
+  const inventoryByProductId = new Map(
+    inventory.map((item) => [item.product_id.toString(), item])
+  );
+
   let synced = 0;
   const errors = [];
 
-  for (const cp of mappings) {
-    if (cp.channel_name === "shopify" && !cp.channel_inventory_item_id) continue;
+  await forEachConcurrent(mappings, MAX_CONCURRENT_SYNC, async (cp) => {
+    if (cp.channel_name === "shopify" && !cp.channel_inventory_item_id) return;
     if (
       cp.channel_name === "daraz" &&
       !cp.channel_seller_sku &&
       !cp.channel_variant_id &&
       !cp.channel_product_id
     ) {
-      continue;
+      return;
     }
 
     const productId = cp.product_id instanceof ObjectId ? cp.product_id : new ObjectId(cp.product_id);
-    const product = await productsColl.findOne({ _id: productId });
-    if (!product) continue;
-
-    const inv = await inventoryColl.findOne({ product_id: productId });
+    const product = productsById.get(productId.toString());
+    if (!product) return;
+    const inv = inventoryByProductId.get(productId.toString());
     const { synced: ok, error } = await syncOneChannelMapping({
       channelName: cp.channel_name,
       cp,
@@ -180,7 +201,7 @@ export async function syncInventoryToChannelsForTenant(tenantName) {
     });
     if (ok) synced++;
     else if (error) errors.push({ product_id: productId.toString(), channel: cp.channel_name, error });
-  }
+  });
 
   return { synced, errors };
 }

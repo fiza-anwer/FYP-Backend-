@@ -178,7 +178,6 @@ export async function getDashboardAnalytics(tenantDb) {
   }
 
   recentOrdersPayload = orders.slice(0, 5).map((o) => {
-    let company_name = null;
     return {
       id: o._id.toString(),
       order_number: o.order_number || o.external_id,
@@ -187,17 +186,27 @@ export async function getDashboardAnalytics(tenantDb) {
       status: o.status || "imported",
       source: o.source,
       created_at: o.created_at,
-      company_name,
+      company_id: o.company_id?.toString() || null,
     };
   });
 
   const companiesColl = tenantDb.collection("companies");
-  for (const ro of recentOrdersPayload) {
-    const o = orders.find((x) => x._id.toString() === ro.id);
-    if (o?.company_id) {
-      const c = await companiesColl.findOne({ _id: o.company_id });
-      ro.company_name = c?.name || null;
-    }
+  const recentCompanyIds = [
+    ...new Map(
+      recentOrdersPayload
+        .filter((order) => order.company_id && ObjectId.isValid(order.company_id))
+        .map((order) => [order.company_id, new ObjectId(order.company_id)])
+    ).values(),
+  ];
+  const recentCompanies = recentCompanyIds.length
+    ? await companiesColl.find({ _id: { $in: recentCompanyIds } }).project({ name: 1 }).toArray()
+    : [];
+  const recentCompanyNames = new Map(
+    recentCompanies.map((company) => [company._id.toString(), company.name || null])
+  );
+  for (const order of recentOrdersPayload) {
+    order.company_name = order.company_id ? recentCompanyNames.get(order.company_id) || null : null;
+    delete order.company_id;
   }
 
   function topProductFromMap(map) {

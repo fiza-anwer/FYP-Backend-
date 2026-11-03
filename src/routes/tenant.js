@@ -961,50 +961,55 @@ router.get("/products", async (req, res) => {
     ]);
     const invByProduct = new Map(inventoryDocs.map((i) => [i.product_id.toString(), i]));
     const cpByProduct = channelProductsLookupMap(channelProductDocs);
-    const list = await Promise.all(
-      products.map(async (p) => {
-        let company_name = null;
-        if (p.company_id) {
-          const company = await companiesColl.findOne({ _id: p.company_id });
-          company_name = company?.name || null;
-        }
-        const pid = p._id.toString();
-        const inv = invByProduct.get(pid);
-        const shopify_synced = isChannelProductSynced(cpByProduct.get(`${pid}:shopify`));
-        const daraz_synced = isChannelProductSynced(cpByProduct.get(`${pid}:daraz`));
-        const quantity = inv && typeof inv.quantity === "number" ? inv.quantity : 0;
-        const allocated = inv && typeof inv.allocated === "number" ? inv.allocated : 0;
-        return {
-          id: p._id.toString(),
-          company_id: p.company_id ? p.company_id.toString() : null,
-          company_name,
-          external_id: p.external_id || null,
-          title: p.title || "",
-          sku: p.sku || "",
-          product_type: p.product_type || "",
-          status: normalizeProductStatus(p.status),
-          price: p.price,
-          price_old: p.price_old,
-          source: p.source,
-          quantity,
-          allocated,
-          shopify_synced,
-          daraz_synced,
-          page_title: p.page_title || undefined,
-          meta_description: p.meta_description || undefined,
-          handle: p.handle || undefined,
-          description: p.description || undefined,
-          images: Array.isArray(p.images) ? p.images : undefined,
-          tags: Array.isArray(p.tags) ? p.tags : undefined,
-          vendor: p.vendor || undefined,
-          integration_slugs: Array.isArray(p.integration_slugs) ? p.integration_slugs : [],
-          variants: Array.isArray(p.variants) ? p.variants : [],
-          variant_count: typeof p.variant_count === "number" ? p.variant_count : Array.isArray(p.variants) ? p.variants.length : 0,
-          created_at: p.created_at,
-          updated_at: p.updated_at,
-        };
-      })
-    );
+    const companyIds = [
+      ...new Map(
+        products.flatMap((product) => {
+          const companyId = toObjectId(product.company_id);
+          return companyId ? [[companyId.toString(), companyId]] : [];
+        })
+      ).values(),
+    ];
+    const companies = companyIds.length
+      ? await companiesColl.find({ _id: { $in: companyIds } }).project({ name: 1 }).toArray()
+      : [];
+    const companyNameById = new Map(companies.map((company) => [company._id.toString(), company.name || null]));
+    const list = products.map((p) => {
+      const pid = p._id.toString();
+      const inv = invByProduct.get(pid);
+      const shopify_synced = isChannelProductSynced(cpByProduct.get(`${pid}:shopify`));
+      const daraz_synced = isChannelProductSynced(cpByProduct.get(`${pid}:daraz`));
+      const quantity = inv && typeof inv.quantity === "number" ? inv.quantity : 0;
+      const allocated = inv && typeof inv.allocated === "number" ? inv.allocated : 0;
+      return {
+        id: p._id.toString(),
+        company_id: p.company_id ? p.company_id.toString() : null,
+        company_name: p.company_id ? companyNameById.get(p.company_id.toString()) || null : null,
+        external_id: p.external_id || null,
+        title: p.title || "",
+        sku: p.sku || "",
+        product_type: p.product_type || "",
+        status: normalizeProductStatus(p.status),
+        price: p.price,
+        price_old: p.price_old,
+        source: p.source,
+        quantity,
+        allocated,
+        shopify_synced,
+        daraz_synced,
+        page_title: p.page_title || undefined,
+        meta_description: p.meta_description || undefined,
+        handle: p.handle || undefined,
+        description: p.description || undefined,
+        images: Array.isArray(p.images) ? p.images : undefined,
+        tags: Array.isArray(p.tags) ? p.tags : undefined,
+        vendor: p.vendor || undefined,
+        integration_slugs: Array.isArray(p.integration_slugs) ? p.integration_slugs : [],
+        variants: Array.isArray(p.variants) ? p.variants : [],
+        variant_count: typeof p.variant_count === "number" ? p.variant_count : Array.isArray(p.variants) ? p.variants.length : 0,
+        created_at: p.created_at,
+        updated_at: p.updated_at,
+      };
+    });
     return res.json({ products: list });
   } catch (err) {
     console.error(err);
@@ -2047,54 +2052,57 @@ router.patch("/inventory/:product_id", async (req, res) => {
       const authDbInv = await getAuthDb();
       const companyOid = product.company_id instanceof ObjectId ? product.company_id : new ObjectId(product.company_id);
       const ciColl = tenantDb.collection("company_integrations");
-
-      if (shopifyCp) {
-        const shopifyIntegration = await authDbInv.collection("integrations").findOne({ slug: "shopify" });
-        if (shopifyIntegration) {
-          const ci = await ciColl.findOne({
+      const integrationsColl = authDbInv.collection("integrations");
+      const [shopifyIntegration, darazIntegration] = await Promise.all([
+        shopifyCp ? integrationsColl.findOne({ slug: "shopify" }) : null,
+        darazCp ? integrationsColl.findOne({ slug: "daraz" }) : null,
+      ]);
+      const [shopifyCi, darazCi] = await Promise.all([
+        shopifyCp && shopifyIntegration
+          ? ciColl.findOne({
             company_id: { $in: [companyOid, companyOid.toString()] },
             integration_id: { $in: [shopifyIntegration._id, shopifyIntegration._id.toString()] },
             status: 1,
-          });
-          if (ci?.credentials) {
-            try {
-              const setResult = await ShopifyIntegration.setInventory(
-                ci.credentials,
-                shopifyCp.channel_inventory_item_id,
-                updated.quantity
-              );
-              if (!setResult.success) console.error("[Shopify] Inventory sync after PATCH failed:", setResult.error);
-            } catch (e) {
-              console.error("[Shopify] Inventory sync after PATCH failed:", e?.message);
-            }
-          }
-        }
-      }
-
-      if (darazCp && (darazCp.channel_seller_sku || darazCp.channel_variant_id || product.sku)) {
-        const darazIntegration = await authDbInv.collection("integrations").findOne({ slug: "daraz" });
-        if (darazIntegration) {
-          const darazCi = await ciColl.findOne({
+          })
+          : null,
+        darazCp && (darazCp.channel_seller_sku || darazCp.channel_variant_id || product.sku) && darazIntegration
+          ? ciColl.findOne({
             company_id: { $in: [companyOid, companyOid.toString()] },
             integration_id: { $in: [darazIntegration._id, darazIntegration._id.toString()] },
             status: 1,
-          });
-          if (darazCi?.credentials) {
-            try {
-              let darazCreds = await DarazIntegration.ensureAccessToken(darazCi.credentials);
-              const setResult = await DarazIntegration.setInventory(darazCreds, {
-                sellerSku: darazCp.channel_seller_sku || product.sku || "",
-                skuId: darazCp.channel_variant_id || "",
-                quantity: updated.quantity,
-                price: product.price != null ? product.price : undefined,
-              });
-              if (!setResult.success) console.error("[Daraz] Inventory sync after PATCH failed:", setResult.error);
-            } catch (e) {
-              console.error("[Daraz] Inventory sync after PATCH failed:", e?.message);
-            }
+          })
+          : null,
+      ]);
+      await Promise.all([
+        (async () => {
+          if (!shopifyCp || !shopifyCi?.credentials) return;
+          try {
+            const setResult = await ShopifyIntegration.setInventory(
+              shopifyCi.credentials,
+              shopifyCp.channel_inventory_item_id,
+              updated.quantity
+            );
+            if (!setResult.success) console.error("[Shopify] Inventory sync after PATCH failed:", setResult.error);
+          } catch (e) {
+            console.error("[Shopify] Inventory sync after PATCH failed:", e?.message);
           }
-        }
-      }
+        })(),
+        (async () => {
+          if (!darazCp || !darazCi?.credentials) return;
+          try {
+            const darazCreds = await DarazIntegration.ensureAccessToken(darazCi.credentials);
+            const setResult = await DarazIntegration.setInventory(darazCreds, {
+              sellerSku: darazCp.channel_seller_sku || product.sku || "",
+              skuId: darazCp.channel_variant_id || "",
+              quantity: updated.quantity,
+              price: product.price != null ? product.price : undefined,
+            });
+            if (!setResult.success) console.error("[Daraz] Inventory sync after PATCH failed:", setResult.error);
+          } catch (e) {
+            console.error("[Daraz] Inventory sync after PATCH failed:", e?.message);
+          }
+        })(),
+      ]);
     }
     return res.json({ quantity: updated.quantity, allocated: updated.allocated });
   } catch (err) {
