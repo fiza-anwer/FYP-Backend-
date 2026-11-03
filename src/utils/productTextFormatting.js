@@ -17,14 +17,21 @@ export function formatSentenceCase(value) {
   return lower.charAt(0).toLocaleUpperCase() + lower.slice(1);
 }
 
+export function normalizeSku(value) {
+  const sku = String(value ?? "").trim();
+  return sku.toLocaleLowerCase() === "other" ? "Other" : sku;
+}
+
 export function normalizeProductText(product) {
   const normalized = {
     title: formatTitleCase(product.title),
     product_type: formatTitleCase(product.product_type),
   };
+  if (product.sku != null) normalized.sku = normalizeSku(product.sku);
   if (Array.isArray(product.variants)) {
     normalized.variants = product.variants.map((variant) => ({
       ...variant,
+      ...(variant.sku != null ? { sku: normalizeSku(variant.sku) } : {}),
       ...(variant.title != null ? { title: formatSentenceCase(variant.title) } : {}),
       ...(variant.option1 != null ? { option1: formatSentenceCase(variant.option1) } : {}),
       ...(variant.option2 != null ? { option2: formatSentenceCase(variant.option2) } : {}),

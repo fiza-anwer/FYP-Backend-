@@ -31,7 +31,12 @@ import {
   generateProductListingFromKeywords,
   getGeminiAiConfig,
 } from "../services/geminiProductService.js";
-import { formatSentenceCase, formatTitleCase, normalizeProductText } from "../utils/productTextFormatting.js";
+import {
+  formatSentenceCase,
+  formatTitleCase,
+  normalizeProductText,
+  normalizeSku,
+} from "../utils/productTextFormatting.js";
 
 async function normalizeDarazCredentials(credentials) {
   const creds = { ...(credentials || {}) };
@@ -1038,6 +1043,7 @@ router.post("/products/standardize-text", async (req, res) => {
       const changed =
         normalized.title !== product.title ||
         normalized.product_type !== product.product_type ||
+        (product.sku != null && normalized.sku !== product.sku) ||
         JSON.stringify(normalized.variants) !== JSON.stringify(product.variants);
       if (!changed) continue;
 
@@ -1248,12 +1254,12 @@ router.post("/products", async (req, res) => {
             return Number.isNaN(n) || n < 0 ? null : Math.floor(n);
           })()
         : null;
-    const skuTrimmed = sku != null ? String(sku).trim() : "";
+    const skuTrimmed = sku != null ? normalizeSku(sku) : "";
     const productTypeTrimmed = formatTitleCase(product_type);
     let variants = Array.isArray(variantsBody)
       ? variantsBody.map((v) => ({
           id: v?.id != null ? String(v.id) : undefined,
-          sku: v?.sku != null ? String(v.sku).trim() : undefined,
+          sku: v?.sku != null ? normalizeSku(v.sku) : undefined,
           title: v?.title != null ? formatSentenceCase(v.title) : undefined,
           option1: v?.option1 != null ? formatSentenceCase(v.option1) : undefined,
           option2: v?.option2 != null ? formatSentenceCase(v.option2) : undefined,
@@ -1545,7 +1551,7 @@ router.put("/products/:id", async (req, res) => {
       if (!t) return res.status(400).json({ error: "Title cannot be empty." });
       update.title = t;
     }
-    if (sku !== undefined) update.sku = String(sku).trim();
+    if (sku !== undefined) update.sku = normalizeSku(sku);
     if (product_type !== undefined) update.product_type = formatTitleCase(product_type);
     if (status !== undefined) update.status = normalizeProductStatus(status);
     if (price !== undefined) update.price = parseProductPrice(price);
@@ -1581,7 +1587,7 @@ router.put("/products/:id", async (req, res) => {
       const variants = Array.isArray(variantsBody)
         ? variantsBody.map((v) => ({
             id: v?.id != null ? String(v.id) : undefined,
-            sku: v?.sku != null ? String(v.sku).trim() : undefined,
+            sku: v?.sku != null ? normalizeSku(v.sku) : undefined,
             title: v?.title != null ? formatSentenceCase(v.title) : undefined,
             option1: v?.option1 != null ? formatSentenceCase(v.option1) : undefined,
             option2: v?.option2 != null ? formatSentenceCase(v.option2) : undefined,
@@ -1606,6 +1612,7 @@ router.put("/products/:id", async (req, res) => {
     const productTextChanged =
       p.title !== previousProduct.title ||
       p.product_type !== previousProduct.product_type ||
+      p.sku !== previousProduct.sku ||
       JSON.stringify(p.variants) !== JSON.stringify(previousProduct.variants);
     let company_name = null;
     if (p.company_id) {
@@ -1656,7 +1663,7 @@ router.put("/products/:id", async (req, res) => {
         if (darazRes.warning) daraz_sync_warning = darazRes.warning;
       } else if (productTextChanged) {
         daraz_sync_warning =
-          "Product text was saved in UniSell, but the current Daraz integration cannot update listing names, categories, or variant labels. Update the listing text in Daraz Seller Center.";
+          "Product text was saved in UniSell, but the current Daraz integration cannot update listing names, categories, variant labels, or seller SKUs. Update the listing in Daraz Seller Center.";
       }
     }
 

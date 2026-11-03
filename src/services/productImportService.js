@@ -5,6 +5,7 @@ import { ensureInventoryForProduct } from "./inventoryService.js";
 import { onInventoryQuantityChanged } from "./stockAlertService.js";
 import { ShopifyIntegration } from "../integrations/Shopify.js";
 import { DarazIntegration } from "../integrations/Daraz.js";
+import { normalizeSku } from "../utils/productTextFormatting.js";
 
 const INTEGRATION_CLASSES = {
   shopify: ShopifyIntegration,
@@ -96,17 +97,21 @@ export async function runProductImportForTenant(tenantName) {
         const raw = product.raw || {};
         const variants = Array.isArray(product.variants) ? product.variants : [];
         const firstVariant = variants[0];
-        const skuTrim = product.sku != null ? String(product.sku).trim() : "";
+        const skuTrim = product.sku != null ? normalizeSku(product.sku) : "";
+        const skuMatch =
+          skuTrim.toLocaleLowerCase() === "other"
+            ? /^other$/i
+            : skuTrim;
         let existing = extId ? await productsColl.findOne({ external_id: extId }) : null;
         if (!existing && skuTrim && companyOid) {
           existing = await productsColl.findOne({
             company_id: { $in: [companyOid, companyOid.toString()] },
-            $or: [{ sku: skuTrim }, { "variants.sku": skuTrim }],
+            $or: [{ sku: skuMatch }, { "variants.sku": skuMatch }],
           });
         }
         if (!existing && skuTrim) {
           existing = await productsColl.findOne({
-            $or: [{ sku: skuTrim }, { "variants.sku": skuTrim }],
+            $or: [{ sku: skuMatch }, { "variants.sku": skuMatch }],
           });
         }
         const importedImages = Array.isArray(product.images)
@@ -121,7 +126,7 @@ export async function runProductImportForTenant(tenantName) {
           company_id: companyOid,
           external_id: product.external_id,
           title: product.title || "",
-          sku: product.sku || "",
+          sku: normalizeSku(product.sku),
           product_type: product.product_type || "",
           status: product.status || "active",
           price: typeof product.price === "number" ? product.price : null,
@@ -131,7 +136,10 @@ export async function runProductImportForTenant(tenantName) {
             : rawImages.length > 0
               ? rawImages
               : existing?.images || [],
-          variants,
+          variants: variants.map((variant) => ({
+            ...variant,
+            ...(variant?.sku != null ? { sku: normalizeSku(variant.sku) } : {}),
+          })),
           variant_count: variants.length,
           raw,
         };

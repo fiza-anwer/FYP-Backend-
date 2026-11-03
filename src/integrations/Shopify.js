@@ -398,6 +398,9 @@ export class ShopifyIntegration {
       if (!remote?.id) return [];
       matchedVariantIds.add(String(remote.id));
       const update = { id: remote.id };
+      if (variant?.sku != null && String(variant.sku) !== String(remote.sku ?? "")) {
+        update.sku = variant.sku;
+      }
       if (variant?.option1 != null && String(variant.option1) !== String(remote.option1 ?? "")) {
         update.option1 = variant.option1;
       }
