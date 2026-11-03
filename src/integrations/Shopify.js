@@ -356,6 +356,90 @@ export class ShopifyIntegration {
     };
   }
 
+  static async updateProduct(credentials, productId, product) {
+    const { shop_domain, access_token } = normalizeShopifyCredentials(credentials);
+    const id = String(productId ?? "").trim();
+    if (!shop_domain || !access_token) {
+      throw new Error("Shopify credentials missing: need shop_domain and access_token.");
+    }
+    if (!/^\d+$/.test(id)) {
+      throw new Error("Shopify product id is invalid.");
+    }
+
+    const url = `https://${shop_domain}/admin/api/${SHOPIFY_API_VERSION}/products/${id}.json`;
+    const headers = {
+      "X-Shopify-Access-Token": access_token,
+      "Content-Type": "application/json",
+    };
+    const currentResponse = await fetch(url, { method: "GET", headers });
+    if (!currentResponse.ok) {
+      const text = await currentResponse.text();
+      throw new Error(`Shopify product lookup error ${currentResponse.status}: ${text.slice(0, 300)}`);
+    }
+    const currentData = await currentResponse.json();
+    const currentVariants = Array.isArray(currentData.product?.variants)
+      ? currentData.product.variants
+      : [];
+    const localVariants = Array.isArray(product.variants) ? product.variants : [];
+    const matchedVariantIds = new Set();
+    const variantUpdates = localVariants.flatMap((variant, index) => {
+      const sku = String(variant?.sku ?? "").trim();
+      const remote =
+        (sku &&
+          currentVariants.find(
+            (candidate) =>
+              !matchedVariantIds.has(String(candidate.id)) &&
+              String(candidate.sku ?? "").trim() === sku
+          )) ||
+        (currentVariants.length === localVariants.length &&
+        !matchedVariantIds.has(String(currentVariants[index]?.id))
+          ? currentVariants[index]
+          : null);
+      if (!remote?.id) return [];
+      matchedVariantIds.add(String(remote.id));
+      const update = { id: remote.id };
+      if (variant?.option1 != null && String(variant.option1) !== String(remote.option1 ?? "")) {
+        update.option1 = variant.option1;
+      }
+      if (variant?.option2 != null && String(variant.option2) !== String(remote.option2 ?? "")) {
+        update.option2 = variant.option2;
+      }
+      return Object.keys(update).length > 1 ? [update] : [];
+    });
+
+    const res = await fetch(url, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({
+        product: {
+          id: Number(id),
+          title: product.title,
+          product_type: product.product_type || "",
+          ...(variantUpdates.length ? { variants: variantUpdates } : {}),
+        },
+      }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Shopify update product error ${res.status}: ${text.slice(0, 300)}`);
+    }
+    const data = await res.json();
+    if (!data.product?.id) {
+      throw new Error("Shopify did not return the updated product.");
+    }
+
+    let categoryWarning = null;
+    if (product.product_type) {
+      try {
+        await setProductCategoryViaGraphQL(shop_domain, access_token, id, product.product_type);
+      } catch (err) {
+        console.warn("[Shopify] Set product category (GraphQL) failed:", err.message);
+        categoryWarning = err.message || "Category could not be set in Shopify.";
+      }
+    }
+    return { product: data.product, categoryWarning };
+  }
+
   /**
    * Get the first location ID for the store (used for inventory set).
    * @returns {Promise<number|null>}
