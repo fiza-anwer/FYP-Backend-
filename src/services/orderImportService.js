@@ -60,6 +60,11 @@ export async function runOrderImportForTenant(tenantName) {
       for (const order of orders) {
         const existing = await ordersColl.findOne({ external_id: order.external_id, source: order.source || slug });
         const raw = order.raw || {};
+        const sourceCreatedAt = raw.created_at || raw.createdAt || order.created_at;
+        const parsedCreatedAt = sourceCreatedAt ? new Date(sourceCreatedAt) : null;
+        const createdAt = parsedCreatedAt && !Number.isNaN(parsedCreatedAt.getTime())
+          ? parsedCreatedAt
+          : existing?.created_at || new Date();
         const ship = raw.shipping_address || raw.shippingAddress || {};
         const shipping_address = {
           address1: ship.address1 || ship.address_1 || "",
@@ -99,7 +104,7 @@ export async function runOrderImportForTenant(tenantName) {
             raw,
             shipping_address,
             line_items: lineItems,
-            created_at: new Date(),
+            created_at: createdAt,
             updated_at: new Date(),
           });
           await increaseAllocatedForOrderLineItems(tenantDb, lineItems);
@@ -107,7 +112,7 @@ export async function runOrderImportForTenant(tenantName) {
         } else {
           await ordersColl.updateOne(
             { external_id: order.external_id, source: order.source || slug },
-            { $set: { shipping_address, raw, line_items: lineItems, updated_at: new Date() } }
+            { $set: { shipping_address, raw, line_items: lineItems, created_at: createdAt, updated_at: new Date() } }
           );
           totalUpdated++;
         }

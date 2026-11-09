@@ -73,6 +73,7 @@ function toObjectId(id) {
 }
 
 const router = express.Router();
+const syncStatusByTenant = new Map();
 router.use(authMiddleware);
 router.use(tenantOnly);
 
@@ -81,6 +82,33 @@ router.use(tenantOnly);
 router.get("/dashboard/analytics", async (req, res) => {
   try {
     const tenantName = req.tenantName;
+    const startDateParam = req.query.start_date;
+    const endDateParam = req.query.end_date;
+    const includeOrders = req.query.include_orders === "true";
+    if ((startDateParam && !endDateParam) || (!startDateParam && endDateParam)) {
+      return res.status(400).json({ error: "Both start_date and end_date are required" });
+    }
+
+    let dateRange = null;
+    if (startDateParam && endDateParam) {
+      const isDateOnly = (value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+      if (!isDateOnly(startDateParam) || !isDateOnly(endDateParam)) {
+        return res.status(400).json({ error: "Dates must use YYYY-MM-DD format" });
+      }
+      const parseDate = (value) => {
+        const [year, month, day] = value.split("-").map(Number);
+        const date = new Date(Date.UTC(year, month - 1, day));
+        return date.toISOString().slice(0, 10) === value ? date : null;
+      };
+      const startDate = parseDate(startDateParam);
+      const endDate = parseDate(endDateParam);
+      if (!startDate || !endDate || startDate > endDate) {
+        return res.status(400).json({ error: "Invalid date range" });
+      }
+      endDate.setUTCDate(endDate.getUTCDate() + 1);
+      dateRange = { startDate, endDate };
+    }
+
     if (!(await tenantDbExists(tenantName))) {
       return res.json({
         hero_product: null,
@@ -91,10 +119,14 @@ router.get("/dashboard/analytics", async (req, res) => {
         revenue_by_month: [],
         stale_products: [],
         summary: { total_orders: 0, total_products: 0, orders_last_30_days: 0, revenue_this_month: 0 },
+        ...(dateRange ? {
+          range_summary: { total_orders: 0, total_revenue: 0, average_order_value: 0 },
+          ...(includeOrders ? { orders_in_range: [] } : {}),
+        } : {}),
       });
     }
     const tenantDb = await getTenantDb(tenantName);
-    const data = await getDashboardAnalytics(tenantDb);
+    const data = await getDashboardAnalytics(tenantDb, { dateRange, includeOrders });
     return res.json(data);
   } catch (err) {
     console.error(err);
@@ -324,10 +356,48 @@ router.post("/cleanup-orphaned-data", async (req, res) => {
   }
 });
 
+/** Current progress of a manual sync for the current tenant. */
+router.get("/sync/status", (req, res) => {
+  const status = syncStatusByTenant.get(req.tenantName);
+  if (!status || (!status.running && Date.now() - status.updated_at > 10 * 60 * 1000)) {
+    syncStatusByTenant.delete(req.tenantName);
+    return res.json({ status: null });
+  }
+  return res.json({ status });
+});
+
 /** Manually sync products, orders, and inventory for the current tenant */
 router.post("/sync", async (req, res) => {
+  const tenantName = req.tenantName;
+  const existingStatus = syncStatusByTenant.get(tenantName);
+  if (existingStatus?.running) {
+    return res.status(409).json({ error: "A sync is already running for this tenant" });
+  }
+
+  const syncStatus = {
+    running: true,
+    phase: "Starting sync",
+    progress: 2,
+    started_at: Date.now(),
+    updated_at: Date.now(),
+    products_pushed: 0,
+    products_pushed_daraz: 0,
+    products_fetched: 0,
+    products_imported: 0,
+    products_updated: 0,
+    orders_fetched: 0,
+    orders_imported: 0,
+    orders_updated: 0,
+    inventory_synced: 0,
+    errors: [],
+  };
+  const updateSyncStatus = (updates) => {
+    Object.assign(syncStatus, updates, { updated_at: Date.now() });
+    syncStatusByTenant.set(tenantName, syncStatus);
+  };
+  syncStatusByTenant.set(tenantName, syncStatus);
+
   try {
-    const tenantName = req.tenantName;
     const result = {
       products_imported: 0,
       products_updated: 0,
@@ -340,50 +410,80 @@ router.post("/sync", async (req, res) => {
       inventory_synced: 0,
       errors: [],
     };
+    updateSyncStatus({ phase: "Publishing pending products to Shopify", progress: 8 });
     const pushRes = await runPushPendingProductsForTenant(tenantName);
     result.products_pushed = pushRes.pushed || 0;
+    updateSyncStatus({ products_pushed: result.products_pushed });
     if (Array.isArray(pushRes.errors) && pushRes.errors.length) {
       result.errors.push(
         ...pushRes.errors.map((e) => ({ scope: "products_push_shopify", error: e.error || String(e) }))
       );
     }
+    updateSyncStatus({ phase: "Publishing pending products to Daraz", progress: 22 });
     const pushDarazRes = await runPushPendingProductsToDarazForTenant(tenantName);
     result.products_pushed_daraz = pushDarazRes.pushed || 0;
+    updateSyncStatus({ products_pushed_daraz: result.products_pushed_daraz });
     if (Array.isArray(pushDarazRes.errors) && pushDarazRes.errors.length) {
       result.errors.push(
         ...pushDarazRes.errors.map((e) => ({ scope: "products_push_daraz", error: e.error || String(e) }))
       );
     }
     // Products import from channel
+    updateSyncStatus({ phase: "Importing products from connected stores", progress: 40 });
     const prodRes = await runProductImportForTenant(tenantName);
     result.products_imported = prodRes.imported || 0;
     result.products_updated = prodRes.updated || 0;
     result.products_fetched = prodRes.fetched || 0;
+    updateSyncStatus({
+      products_fetched: result.products_fetched,
+      products_imported: result.products_imported,
+      products_updated: result.products_updated,
+    });
     if (Array.isArray(prodRes.errors) && prodRes.errors.length) {
       result.errors.push(
         ...prodRes.errors.map((e) => ({ scope: "products", error: e.error || String(e) }))
       );
     }
     // Orders
+    updateSyncStatus({ phase: "Importing orders from connected stores", progress: 60 });
     const orderRes = await runOrderImportForTenant(tenantName);
     result.orders_imported = orderRes.imported || 0;
     result.orders_updated = orderRes.updated || 0;
     result.orders_fetched = orderRes.fetched || 0;
+    updateSyncStatus({
+      orders_fetched: result.orders_fetched,
+      orders_imported: result.orders_imported,
+      orders_updated: result.orders_updated,
+    });
     if (Array.isArray(orderRes.errors) && orderRes.errors.length) {
       result.errors.push(
         ...orderRes.errors.map((e) => ({ scope: "orders", error: e.error || String(e) }))
       );
     }
     // Inventory sync to channels
+    updateSyncStatus({ phase: "Updating inventory in connected stores", progress: 82 });
     const invRes = await syncInventoryToChannelsForTenant(tenantName);
     result.inventory_synced = invRes.synced || 0;
+    updateSyncStatus({ inventory_synced: result.inventory_synced });
     if (Array.isArray(invRes.errors) && invRes.errors.length) {
       result.errors.push(
         ...invRes.errors.map((e) => ({ scope: "inventory", error: e.error || String(e) }))
       );
     }
+    updateSyncStatus({
+      running: false,
+      phase: "Sync completed",
+      progress: 100,
+      errors: result.errors,
+    });
     return res.json(result);
   } catch (err) {
+    updateSyncStatus({
+      running: false,
+      phase: "Sync failed",
+      progress: 100,
+      errors: [{ scope: "sync", error: err?.message || "Sync failed" }],
+    });
     console.error("Manual sync error:", err);
     return res.status(500).json({ error: "Sync failed" });
   }

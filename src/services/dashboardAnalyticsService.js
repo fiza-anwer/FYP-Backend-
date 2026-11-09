@@ -39,6 +39,10 @@ function monthKey(d) {
   return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}`;
 }
 
+function utcMonthKey(d) {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
 function monthLabel(key) {
   const [y, m] = key.split("-");
   const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -53,8 +57,10 @@ function pickStrategy(productId) {
 }
 
 function orderDate(order) {
-  const d = order.created_at || order.updated_at;
-  return d ? new Date(d) : null;
+  const d = order.raw?.created_at || order.raw?.createdAt || order.created_at || order.updated_at;
+  if (!d) return null;
+  const parsed = new Date(d);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 function extractLineItems(order) {
@@ -83,7 +89,7 @@ function extractLineItems(order) {
 /**
  * Build tenant dashboard analytics from orders + products.
  */
-export async function getDashboardAnalytics(tenantDb) {
+export async function getDashboardAnalytics(tenantDb, { dateRange = null, includeOrders = false } = {}) {
   const ordersColl = tenantDb.collection("orders");
   const productsColl = tenantDb.collection("products");
 
@@ -100,6 +106,33 @@ export async function getDashboardAnalytics(tenantDb) {
     ordersColl.find({}).sort({ created_at: -1 }).limit(5000).toArray(),
     productsColl.find({}).project({ title: 1, sku: 1, price: 1, product_type: 1, company_id: 1 }).toArray(),
   ]);
+  let rangeOrders = [];
+  if (dateRange) {
+    const { startDate, endDate } = dateRange;
+    rangeOrders = await ordersColl.find({
+      $or: [
+        { created_at: { $gte: startDate, $lt: endDate } },
+        { "raw.created_at": { $gte: startDate, $lt: endDate } },
+        { "raw.createdAt": { $gte: startDate, $lt: endDate } },
+        {
+          "raw.created_at": {
+            $gte: startDate.toISOString(),
+            $lt: endDate.toISOString(),
+          },
+        },
+        {
+          "raw.createdAt": {
+            $gte: startDate.toISOString(),
+            $lt: endDate.toISOString(),
+          },
+        },
+      ],
+    }).sort({ created_at: 1 }).toArray();
+    rangeOrders = rangeOrders.filter((order) => {
+      const created = orderDate(order);
+      return created && created >= startDate && created < endDate;
+    });
+  }
 
   const productMap = new Map();
   for (const p of products) {
@@ -125,6 +158,7 @@ export async function getDashboardAnalytics(tenantDb) {
   const productLastOrder = new Map();
   const ordersByDay = new Map();
   const revenueByMonth = new Map();
+  const rangeProductOrderCounts = new Map();
 
   for (let i = 0; i < 30; i++) {
     const d = new Date(chartDaysStart);
@@ -138,18 +172,71 @@ export async function getDashboardAnalytics(tenantDb) {
 
   let recentOrdersPayload = [];
 
+  if (dateRange) {
+    const { startDate, endDate } = dateRange;
+    const daysInRange = (endDate.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000);
+    const monthlyOrderBuckets = daysInRange > 90;
+    const orderBuckets = new Map();
+    const rangeRevenueByMonth = new Map();
+    for (let cursor = monthlyOrderBuckets
+      ? new Date(Date.UTC(startDate.getUTCFullYear(), startDate.getUTCMonth(), 1))
+      : new Date(startDate); cursor < endDate;) {
+      const key = monthlyOrderBuckets
+        ? utcMonthKey(cursor)
+        : cursor.toISOString().slice(0, 10);
+      orderBuckets.set(key, 0);
+      if (monthlyOrderBuckets) cursor.setUTCMonth(cursor.getUTCMonth() + 1);
+      else cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+    for (const order of rangeOrders) {
+      const created = orderDate(order);
+      if (!created || created < startDate || created >= endDate) continue;
+      const orderKey = monthlyOrderBuckets
+        ? utcMonthKey(created)
+        : created.toISOString().slice(0, 10);
+      if (orderBuckets.has(orderKey)) {
+        orderBuckets.set(orderKey, orderBuckets.get(orderKey) + 1);
+      }
+      const month = utcMonthKey(created);
+      rangeRevenueByMonth.set(month, (rangeRevenueByMonth.get(month) || 0) + (parseFloat(order.total) || 0));
+      for (const line of extractLineItems(order)) {
+        const productId = line.product_id || skuToProductId.get(String(line.sku || "").trim().toLowerCase());
+        if (productId) {
+          rangeProductOrderCounts.set(
+            productId,
+            (rangeProductOrderCounts.get(productId) || 0) + line.quantity,
+          );
+        }
+      }
+    }
+    ordersByDay.clear();
+    for (const [key, count] of orderBuckets) ordersByDay.set(key, count);
+    revenueByMonth.clear();
+    for (const [month, revenue] of rangeRevenueByMonth) revenueByMonth.set(month, revenue);
+
+    const startMonth = utcMonthKey(startDate);
+    const endMonth = utcMonthKey(new Date(endDate.getTime() - 1));
+    for (let cursor = new Date(`${startMonth}-01T00:00:00.000Z`); utcMonthKey(cursor) <= endMonth;) {
+      const key = utcMonthKey(cursor);
+      if (!revenueByMonth.has(key)) revenueByMonth.set(key, 0);
+      cursor.setUTCMonth(cursor.getUTCMonth() + 1);
+    }
+  }
+
   for (const order of orders) {
     const created = orderDate(order);
     const dayKey = created ? startOfDay(created).toISOString().slice(0, 10) : null;
     const mKey = created ? monthKey(created) : null;
 
-    if (dayKey && ordersByDay.has(dayKey)) {
-      ordersByDay.set(dayKey, (ordersByDay.get(dayKey) || 0) + 1);
-    }
+    if (!dateRange) {
+      if (dayKey && ordersByDay.has(dayKey)) {
+        ordersByDay.set(dayKey, (ordersByDay.get(dayKey) || 0) + 1);
+      }
 
-    if (created && created >= revenueMonthStart && mKey) {
-      const total = parseFloat(order.total) || 0;
-      revenueByMonth.set(mKey, (revenueByMonth.get(mKey) || 0) + total);
+      if (created && created >= revenueMonthStart && mKey) {
+        const total = parseFloat(order.total) || 0;
+        revenueByMonth.set(mKey, (revenueByMonth.get(mKey) || 0) + total);
+      }
     }
 
     let lines = extractLineItems(order);
@@ -226,7 +313,7 @@ export async function getDashboardAnalytics(tenantDb) {
   const heroProduct = topProductFromMap(productOrderCounts);
   const heroProductMonth = topProductFromMap(productOrderCountsMonth);
 
-  const topProducts = [...productOrderCounts.entries()]
+  const topProducts = [...(dateRange ? rangeProductOrderCounts : productOrderCounts).entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, 5)
     .map(([pid, count]) => {
@@ -259,13 +346,13 @@ export async function getDashboardAnalytics(tenantDb) {
   });
 
   const orders_by_day = [...ordersByDay.entries()].map(([date, count]) => ({ date, count }));
-  const revenue_by_month = [...revenueByMonth.entries()].map(([month, revenue]) => ({
+  const revenue_by_month = [...revenueByMonth.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([month, revenue]) => ({
     month,
     label: monthLabel(month),
     revenue: Math.round(revenue * 100) / 100,
   }));
 
-  return {
+  const result = {
     hero_product: heroProduct,
     hero_product_month: heroProductMonth,
     top_products: topProducts,
@@ -280,7 +367,49 @@ export async function getDashboardAnalytics(tenantDb) {
         const d = orderDate(o);
         return d && d >= thirtyDaysAgo;
       }).length,
-      revenue_this_month: revenueByMonth.get(monthKey(now)) || 0,
+      revenue_this_month: revenueByMonth.get(dateRange ? utcMonthKey(now) : monthKey(now)) || 0,
     },
   };
+
+  if (dateRange) {
+    const totalRevenue = rangeOrders.reduce((total, order) => total + (parseFloat(order.total) || 0), 0);
+    result.range_summary = {
+      total_orders: rangeOrders.length,
+      total_revenue: Math.round(totalRevenue * 100) / 100,
+      average_order_value: rangeOrders.length
+        ? Math.round((totalRevenue / rangeOrders.length) * 100) / 100
+        : 0,
+    };
+
+    if (includeOrders) {
+      const companyIds = [
+        ...new Set(rangeOrders.map((order) => order.company_id?.toString()).filter(Boolean)),
+      ].filter(ObjectId.isValid).map((id) => new ObjectId(id));
+      const companies = companyIds.length
+        ? await companiesColl.find({ _id: { $in: companyIds } }).project({ name: 1 }).toArray()
+        : [];
+      const companyNames = new Map(companies.map((company) => [company._id.toString(), company.name || ""]));
+      result.orders_in_range = rangeOrders
+        .map((order) => {
+          const created = orderDate(order);
+          if (!created || created < dateRange.startDate || created >= dateRange.endDate) return null;
+          return {
+            id: order._id.toString(),
+            order_number: order.order_number || order.external_id || "",
+            email: order.email || "",
+            total: parseFloat(order.total) || 0,
+            currency: order.currency || order.raw?.currency || "",
+            status: order.status || "imported",
+            financial_status: order.financial_status || "",
+            fulfillment_status: order.fulfillment_status || "",
+            source: order.source || "",
+            created_at: created.toISOString(),
+            company_name: order.company_id ? companyNames.get(order.company_id.toString()) || "" : "",
+          };
+        })
+        .filter(Boolean);
+    }
+  }
+
+  return result;
 }
