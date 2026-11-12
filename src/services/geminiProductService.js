@@ -26,7 +26,7 @@ const LISTING_SCHEMA = `{
   "handle": "string — URL slug, lowercase hyphenated",
   "sku": "string — unique SKU code",
   "product_type": "string — category e.g. T-Shirts, Jewellery",
-  "price": "number — suggested retail price in USD",
+  "price": "number — suggested retail price in PKR",
   "price_old": "number or null — compare-at price if on sale, else null",
   "vendor": "string — brand or store name",
   "tags": ["string array — 3-8 relevant tags"]
@@ -244,7 +244,7 @@ ${LISTING_SCHEMA}
 
 Rules:
 - Write in English unless keywords clearly indicate another language.
-- Prices should be realistic for the product type (USD).
+- Prices should be realistic for the product type (PKR).
 - Description must be customer-friendly HTML with <p> tags only.
 - SKU should look like a real product code (letters + numbers).
 - handle must be URL-safe (lowercase, hyphens).`;
