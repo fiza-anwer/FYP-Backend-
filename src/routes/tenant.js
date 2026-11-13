@@ -77,6 +77,16 @@ const syncStatusByTenant = new Map();
 router.use(authMiddleware);
 router.use(tenantOnly);
 
+function getListPagination(query) {
+  if (query.limit === undefined) return null;
+  const limit = Number(query.limit);
+  const offset = Number(query.offset ?? 0);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !Number.isInteger(offset) || offset < 0) {
+    return { error: "Invalid pagination parameters" };
+  }
+  return { limit, offset };
+}
+
 // ---------- Companies (tenant-scoped) ----------
 /** Dashboard analytics: hero products, charts, stale inventory strategies */
 router.get("/dashboard/analytics", async (req, res) => {
@@ -761,8 +771,10 @@ router.get("/orders", async (req, res) => {
     const companyId = req.query.company_id;
     const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
     const sortParam = typeof req.query.sort === "string" ? req.query.sort.trim().toLowerCase() : "newest";
+    const pagination = getListPagination(req.query);
+    if (pagination?.error) return res.status(400).json({ error: pagination.error });
     if (!(await tenantDbExists(tenantName))) {
-      return res.json({ orders: [] });
+      return res.json({ orders: [], ...(pagination ? { has_more: false } : {}) });
     }
     const tenantDb = await getTenantDb(tenantName);
     const companiesColl = tenantDb.collection("companies");
@@ -774,6 +786,13 @@ router.get("/orders", async (req, res) => {
       } catch {
         return res.status(400).json({ error: "Invalid company_id" });
       }
+    }
+    if (typeof req.query.order_ids === "string" && req.query.order_ids.trim()) {
+      const orderIds = req.query.order_ids.split(",").filter(Boolean);
+      if (orderIds.length > 100 || orderIds.some((id) => !ObjectId.isValid(id))) {
+        return res.status(400).json({ error: "Invalid order_ids" });
+      }
+      filter._id = { $in: orderIds.map((id) => new ObjectId(id)) };
     }
     if (search) {
       const re = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
@@ -790,13 +809,16 @@ router.get("/orders", async (req, res) => {
       filter.$or = or;
     }
     const sortOrder = sortParam === "oldest" ? { created_at: 1 } : { created_at: -1 };
-    const limit = search ? 50 : 500;
-    const orders = await tenantDb
+    const limit = pagination ? pagination.limit : search ? 50 : 500;
+    const cursor = tenantDb
       .collection("orders")
       .find(filter)
       .sort(sortOrder)
-      .limit(limit)
-      .toArray();
+      .skip(pagination?.offset ?? 0)
+      .limit(pagination ? limit + 1 : limit);
+    const fetchedOrders = await cursor.toArray();
+    const hasMore = !!pagination && fetchedOrders.length > limit;
+    const orders = pagination ? fetchedOrders.slice(0, limit) : fetchedOrders;
     const list = await Promise.all(
       orders.map(async (o) => {
         let company_name = null;
@@ -832,7 +854,7 @@ router.get("/orders", async (req, res) => {
         };
       })
     );
-    return res.json({ orders: list });
+    return res.json({ orders: list, ...(pagination ? { has_more: hasMore } : {}) });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Server error" });
@@ -1005,8 +1027,10 @@ router.get("/products", async (req, res) => {
     const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
     const productType = typeof req.query.product_type === "string" ? req.query.product_type.trim() : "";
     const sortParam = typeof req.query.sort === "string" ? req.query.sort.trim().toLowerCase() : "newest";
+    const pagination = getListPagination(req.query);
+    if (pagination?.error) return res.status(400).json({ error: pagination.error });
     if (!(await tenantDbExists(tenantName))) {
-      return res.json({ products: [] });
+      return res.json({ products: [], ...(pagination ? { has_more: false } : {}) });
     }
     const tenantDb = await getTenantDb(tenantName);
     const companiesColl = tenantDb.collection("companies");
@@ -1043,12 +1067,15 @@ router.get("/products", async (req, res) => {
       price_desc: { price: -1 },
     };
     const sortOrder = sortOpts[sortParam] || sortOpts.newest;
-    const products = await tenantDb
+    const cursor = tenantDb
       .collection("products")
       .find(filter)
       .sort(sortOrder)
-      .limit(500)
-      .toArray();
+      .skip(pagination?.offset ?? 0)
+      .limit(pagination ? pagination.limit + 1 : 500);
+    const fetchedProducts = await cursor.toArray();
+    const hasMore = !!pagination && fetchedProducts.length > pagination.limit;
+    const products = pagination ? fetchedProducts.slice(0, pagination.limit) : fetchedProducts;
     const inventoryColl = tenantDb.collection("inventory");
     const channelProductsColl = tenantDb.collection("channel_products");
     const productIds = products.map((p) => p._id);
@@ -1110,7 +1137,7 @@ router.get("/products", async (req, res) => {
         updated_at: p.updated_at,
       };
     });
-    return res.json({ products: list });
+    return res.json({ products: list, ...(pagination ? { has_more: hasMore } : {}) });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Server error" });
@@ -2298,8 +2325,10 @@ router.get("/consignments", async (req, res) => {
     const tenantName = req.tenantName;
     const orderId = req.query.order_id;
     const companyId = req.query.company_id;
+    const pagination = getListPagination(req.query);
+    if (pagination?.error) return res.status(400).json({ error: pagination.error });
     if (!(await tenantDbExists(tenantName))) {
-      return res.json({ consignments: [] });
+      return res.json({ consignments: [], ...(pagination ? { has_more: false } : {}) });
     }
     const tenantDb = await getTenantDb(tenantName);
     const authDb = await getAuthDb();
@@ -2321,12 +2350,15 @@ router.get("/consignments", async (req, res) => {
         return res.status(400).json({ error: "Invalid company_id" });
       }
     }
-    const list = await tenantDb
+    const fetchedList = await tenantDb
       .collection("consignments")
       .find(filter)
       .sort({ created_at: -1 })
-      .limit(500)
+      .skip(pagination?.offset ?? 0)
+      .limit(pagination ? pagination.limit + 1 : 500)
       .toArray();
+    const hasMore = !!pagination && fetchedList.length > pagination.limit;
+    const list = pagination ? fetchedList.slice(0, pagination.limit) : fetchedList;
     const carriersColl = authDb.collection("carriers");
     const servicesColl = authDb.collection("carrier_services");
     const withDetails = await Promise.all(
@@ -2351,7 +2383,7 @@ router.get("/consignments", async (req, res) => {
         };
       })
     );
-    return res.json({ consignments: withDetails });
+    return res.json({ consignments: withDetails, ...(pagination ? { has_more: hasMore } : {}) });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Server error" });

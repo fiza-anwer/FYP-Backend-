@@ -21,6 +21,10 @@ import {
 import { syncInventoryToChannelsForAllTenants } from "./src/services/inventorySyncService.js";
 import { scanZeroStockForAllTenants } from "./src/services/stockAlertService.js";
 
+import dns from "node:dns";
+
+dns.setServers(["8.8.8.8", "8.8.4.4"]);
+
 const app = express();
 
 const allowedOrigins = [
