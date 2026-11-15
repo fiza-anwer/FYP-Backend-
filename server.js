@@ -29,6 +29,9 @@ const app = express();
 
 const allowedOrigins = [
   "http://localhost:5173",
+  "http://localhost:8081",
+  "http://127.0.0.1:8081",
+  "http://localhost:19006",
   "https://unisell-gamma.vercel.app",
   "https://unisell-git-main-fiza-anwers-projects.vercel.app",
   // production domain bhi add kar lo (Vercel Overview mein dikhta hai)
