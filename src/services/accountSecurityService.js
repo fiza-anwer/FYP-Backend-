@@ -6,6 +6,8 @@ import nodemailer from "nodemailer";
 import { config } from "../config.js";
 import jwt from "jsonwebtoken";
 
+export const AUTH_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
 let transporter;
 
 export function createToken() {
@@ -23,7 +25,7 @@ export function createSessionId() {
 export async function createAuthenticatedSession(db, req, userKey, claims) {
   const sessionId = createSessionId();
   const createdAt = new Date();
-  const expiresAt = new Date(createdAt.getTime() + 7 * 24 * 60 * 60 * 1000);
+  const expiresAt = new Date(createdAt.getTime() + AUTH_SESSION_TTL_MS);
   const userAgent = String(req.get("user-agent") || "Unknown device").slice(0, 300);
   await db.collection("auth_sessions").insertOne({
     _id: sessionId,
@@ -35,7 +37,7 @@ export async function createAuthenticatedSession(db, req, userKey, claims) {
     ip_address: String(req.ip || "").slice(0, 64),
   });
   const token = jwt.sign({ ...claims, jti: sessionId, sub: userKey }, config.jwtSecret, {
-    expiresIn: "7d",
+    expiresIn: "24h",
   });
   return { token, sessionId, createdAt, expiresAt };
 }

@@ -1,12 +1,15 @@
 import { ObjectId } from "mongodb";
 import { getAuthDb } from "../db/authDb.js";
 import { getTenantDb, tenantDbExists } from "../db/tenantDb.js";
+import { decryptStoredCredentials } from "../db/credentialEncryption.js";
 import { ensureInventoryForProduct } from "./inventoryService.js";
 import { onInventoryQuantityChanged } from "./stockAlertService.js";
 import { ShopifyIntegration } from "../integrations/Shopify.js";
 import { DarazIntegration } from "../integrations/Daraz.js";
 import { normalizeSku } from "../utils/productTextFormatting.js";
+import { withShopifyChannelSkus } from "../utils/channelSkus.js";
 import { forEachConcurrent } from "./forEachConcurrent.js";
+import { persistDarazCredentialsIfChanged, withPersistedDarazCredentials } from "./darazCredentialService.js";
 
 const MAX_CONCURRENT_PRODUCT_PUSHES = 3;
 
@@ -78,17 +81,19 @@ export async function runProductImportForTenant(tenantName) {
       continue;
     }
     try {
-      let credentials = ci.credentials || {};
+      let credentials = decryptStoredCredentials(ci.credentials || {});
       if (slug === "daraz") {
         credentials = await DarazIntegration.ensureAccessToken(credentials);
-        if (credentials.access_token && credentials.access_token !== ci.credentials?.access_token) {
-          await companyIntegrations.updateOne(
-            { _id: ci._id },
-            { $set: { credentials, updated_at: new Date() } }
-          );
-        }
       }
-      const products = await Klass.fetchProducts(credentials);
+      const products =
+        slug === "daraz"
+          ? await withPersistedDarazCredentials(
+              companyIntegrations,
+              ci,
+              credentials,
+              () => Klass.fetchProducts(credentials)
+            )
+          : await Klass.fetchProducts(credentials);
       totalFetched += products.length;
       const companyOid = ci.company_id
         ? typeof ci.company_id === "string"
@@ -196,13 +201,31 @@ export async function runProductImportForTenant(tenantName) {
               ? String(raw.variants[0].inventory_item_id)
               : null;
         if ((slug === "shopify" || slug === "daraz") && channelProductId) {
+          const channelVariants = Array.isArray(product.variants)
+            ? product.variants.map((variant) => ({
+                internal_sku: String(variant?.sku || "").trim(),
+                channel_sku: String(variant?.sku || "").trim() || null,
+                ...(slug === "daraz"
+                  ? { channel_seller_sku: String(variant?.sku || "").trim() || null }
+                  : {}),
+                channel_variant_id: variant?.id != null ? String(variant.id) : null,
+                channel_inventory_item_id:
+                  variant?.inventory_item_id != null ? String(variant.inventory_item_id) : null,
+              }))
+            : [];
           const cpSet = {
             channel_product_id: channelProductId,
             channel_variant_id: channelVariantId,
             channel_inventory_item_id: channelInventoryItemId,
+            channel_variants: channelVariants,
             updated_at: new Date(),
           };
-          if (channelSellerSku) cpSet.channel_seller_sku = channelSellerSku;
+          if (channelSellerSku) {
+            cpSet.channel_sku = channelSellerSku;
+            cpSet.channel_seller_sku = channelSellerSku;
+          } else if (slug === "shopify") {
+            cpSet.channel_sku = String(firstVariant?.sku || product.sku || "").trim() || null;
+          }
           await channelProductsColl.updateOne(
             { product_id: productId, channel_name: slug },
             { $set: cpSet },
@@ -313,7 +336,7 @@ export async function runPushPendingProductsForTenant(tenantName) {
     if (!ci) return;
 
     try {
-      const pushResult = await ShopifyIntegration.createProduct(ci.credentials, {
+      const shopifyProduct = withShopifyChannelSkus({
         title: p.title,
         description: p.description,
         product_type: p.product_type,
@@ -328,7 +351,8 @@ export async function runPushPendingProductsForTenant(tenantName) {
         images: p.images,
         sizes: p.sizes,
         variants: p.variants,
-      });
+      }, p._id);
+      const pushResult = await ShopifyIntegration.createProduct(ci.credentials, shopifyProduct);
       if (!pushResult?.external_id) {
         errors.push({ product_id: p._id.toString(), error: "Shopify did not return product id" });
         return;
@@ -344,6 +368,8 @@ export async function runPushPendingProductsForTenant(tenantName) {
             channel_product_id: pushResult.channel_product_id || pushResult.external_id,
             channel_variant_id: pushResult.channel_variant_id || null,
             channel_inventory_item_id: pushResult.channel_inventory_item_id || null,
+            channel_sku: pushResult.channel_sku || shopifyProduct.sku || shopifyProduct.variants?.[0]?.sku || null,
+            channel_variants: pushResult.channel_variants || [],
             updated_at: new Date(),
           },
         },
@@ -420,13 +446,9 @@ export async function runPushPendingProductsToDarazForTenant(tenantName) {
       )
       .map(async (ci) => {
         try {
-          const credentials = await DarazIntegration.ensureAccessToken(ci.credentials);
-          if (credentials.access_token !== ci.credentials?.access_token) {
-            await companyIntegrationsColl.updateOne(
-              { _id: ci._id },
-              { $set: { credentials, updated_at: new Date() } }
-            );
-          }
+          const previousCredentials = decryptStoredCredentials(ci.credentials);
+          const credentials = await DarazIntegration.ensureAccessToken(previousCredentials);
+          await persistDarazCredentialsIfChanged(companyIntegrationsColl, ci, credentials);
           credentialsByCiId.set(ci._id.toString(), { credentials });
         } catch (error) {
           credentialsByCiId.set(ci._id.toString(), { error });
@@ -457,18 +479,24 @@ export async function runPushPendingProductsToDarazForTenant(tenantName) {
       const inv = inventoryByProductId.get(p._id.toString());
       const qty = inv && typeof inv.quantity === "number" ? inv.quantity : 0;
 
-      const darazPush = await DarazIntegration.pushProduct(
+      const darazPush = await withPersistedDarazCredentials(
+        companyIntegrationsColl,
+        ci,
         credentials,
-        {
-          ...p,
-          quantity: qty,
-          inventory_quantity: qty,
-          description: p.description,
-          images: p.images,
-          vendor: p.vendor,
-          product_type: p.product_type,
-        },
-        cp
+        () =>
+          DarazIntegration.pushProduct(
+            credentials,
+            {
+              ...p,
+              quantity: qty,
+              inventory_quantity: qty,
+              description: p.description,
+              images: p.images,
+              vendor: p.vendor,
+              product_type: p.product_type,
+            },
+            cp
+          )
       );
 
       await channelProductsColl.updateOne(
@@ -479,6 +507,14 @@ export async function runPushPendingProductsToDarazForTenant(tenantName) {
               darazPush.channel_product_id || cp.channel_product_id || p.external_id || null,
             channel_variant_id: darazPush.channel_variant_id || cp.channel_variant_id || null,
             channel_seller_sku: darazPush.channel_seller_sku || cp.channel_seller_sku || sku,
+            channel_sku: darazPush.channel_seller_sku || cp.channel_sku || cp.channel_seller_sku || sku,
+            channel_variants: [{
+              internal_sku: String(p.variants?.[0]?.sku || p.sku || "").trim(),
+              channel_sku: darazPush.channel_seller_sku || cp.channel_sku || cp.channel_seller_sku || sku,
+              channel_seller_sku: darazPush.channel_seller_sku || cp.channel_seller_sku || sku,
+              channel_variant_id: darazPush.channel_variant_id || cp.channel_variant_id || null,
+              channel_product_id: darazPush.channel_product_id || cp.channel_product_id || p.external_id || null,
+            }],
             updated_at: new Date(),
           },
         },

@@ -1,7 +1,9 @@
 import { ObjectId } from "mongodb";
 import { getAuthDb } from "../db/authDb.js";
+import { decryptStoredCredentials } from "../db/credentialEncryption.js";
 import { DarazIntegration } from "../integrations/Daraz.js";
 import { validateProductImagesForDaraz } from "../utils/productImageUrls.js";
+import { withPersistedDarazCredentials } from "./darazCredentialService.js";
 
 function darazPushEnabled(integrationSlugs) {
   const slugs = Array.isArray(integrationSlugs) ? integrationSlugs : [];
@@ -60,36 +62,45 @@ export async function pushProductToDarazForCompany(tenantDb, product, productId,
   const invDoc = await tenantDb.collection("inventory").findOne({ product_id: pid });
   const qty = invDoc && typeof invDoc.quantity === "number" ? invDoc.quantity : 0;
 
-  let darazCreds = await DarazIntegration.ensureAccessToken(darazCi.credentials);
-  if (darazCreds.access_token !== darazCi.credentials?.access_token) {
-    await companyIntegrationsColl.updateOne(
-      { _id: darazCi._id },
-      { $set: { credentials: darazCreds, updated_at: new Date() } }
-    );
-  }
+  const storedCredentials = decryptStoredCredentials(darazCi.credentials);
+  const darazCreds = await DarazIntegration.ensureAccessToken(storedCredentials);
 
   const cpColl = tenantDb.collection("channel_products");
   const existingCp = (await cpColl.findOne({ product_id: pid, channel_name: "daraz" })) || {};
 
   try {
-    const darazPush = await DarazIntegration.pushProduct(
+    const darazPush = await withPersistedDarazCredentials(
+      companyIntegrationsColl,
+      darazCi,
       darazCreds,
-      {
-        ...product,
-        sku,
-        quantity: qty,
-        inventory_quantity: qty,
-      },
-      existingCp
+      () =>
+        DarazIntegration.pushProduct(
+          darazCreds,
+          {
+            ...product,
+            sku,
+            quantity: qty,
+            inventory_quantity: qty,
+          },
+          existingCp
+        )
     );
 
     await cpColl.updateOne(
       { product_id: pid, channel_name: "daraz" },
       {
         $set: {
+          channel_sku: darazPush.channel_seller_sku || sku,
           channel_seller_sku: darazPush.channel_seller_sku || sku,
           channel_variant_id: darazPush.channel_variant_id || null,
           channel_product_id: darazPush.channel_product_id || null,
+          channel_variants: [{
+            internal_sku: String(product.variants?.[0]?.sku || product.sku || "").trim(),
+            channel_sku: darazPush.channel_seller_sku || sku,
+            channel_seller_sku: darazPush.channel_seller_sku || sku,
+            channel_variant_id: darazPush.channel_variant_id || null,
+            channel_product_id: darazPush.channel_product_id || null,
+          }],
           updated_at: new Date(),
         },
       },

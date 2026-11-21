@@ -1,6 +1,7 @@
 import jwt from "jsonwebtoken";
 import { config } from "../config.js";
 import { getAuthDb } from "../db/authDb.js";
+import { AUTH_SESSION_TTL_MS } from "../services/accountSecurityService.js";
 
 /**
  * Verify JWT from Authorization: Bearer <token> or from cookie, set req.user and req.tenantName.
@@ -20,10 +21,12 @@ export async function authMiddleware(req, res, next) {
       return res.status(401).json({ error: "Session expired. Please sign in again." });
     }
     const db = await getAuthDb();
+    const activeSince = new Date(Date.now() - AUTH_SESSION_TTL_MS);
     const session = await db.collection("auth_sessions").findOneAndUpdate(
       {
         _id: payload.jti,
         user_key: payload.sub,
+        created_at: { $gt: activeSince },
         expires_at: { $gt: new Date() },
         revoked_at: { $exists: false },
       },

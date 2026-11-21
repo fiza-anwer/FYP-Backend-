@@ -329,6 +329,12 @@ export async function createDarazProduct(accessToken, product) {
 
   const skuList = data?.sku_list || data?.skus || [];
   const firstSku = Array.isArray(skuList) ? skuList[0] : null;
+  const returnedSellerSku = [
+    firstSku?.SellerSku,
+    firstSku?.seller_sku,
+    data?.SellerSku,
+    data?.seller_sku,
+  ].find((value) => typeof value === "string" && value.trim());
   const skuId =
     firstSku?.sku_id != null
       ? String(firstSku.sku_id)
@@ -346,7 +352,7 @@ export async function createDarazProduct(accessToken, product) {
   return {
     item_id: itemId,
     sku_id: skuId,
-    seller_sku: sellerSku,
+    seller_sku: returnedSellerSku ? returnedSellerSku.trim() : sellerSku,
     primary_category_id: categoryId,
   };
 }

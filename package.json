@@ -6,7 +6,9 @@
     "dev": "node --watch server.js",
     "start": "node server.js",
     "migrate": "node src/migrations/run.js",
-    "migrate:superadmin": "node src/migrations/016_reset_superadmin_password.js"
+    "migrate:superadmin": "node src/migrations/016_reset_superadmin_password.js",
+    "encrypt:credentials": "node src/scripts/encryptStoredCredentials.js",
+    "restore:credentials": "node src/scripts/restorePlaintextCredentials.js"
   },
   "dependencies": {
     "axios": "^1.16.1",

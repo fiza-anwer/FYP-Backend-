@@ -3,6 +3,7 @@ import { ObjectId } from "mongodb";
 import { authMiddleware, tenantOnly } from "../middleware/auth.js";
 import { getAuthDb } from "../db/authDb.js";
 import { getTenantDb, tenantDbExists } from "../db/tenantDb.js";
+import { decryptStoredCredentials, encryptCredentialTree } from "../db/credentialEncryption.js";
 import { createConsignments } from "../services/consignmentService.js";
 import { dispatchOrders } from "../services/dispatchService.js";
 import {
@@ -22,6 +23,7 @@ import { syncInventoryToChannelsForTenant } from "../services/inventorySyncServi
 import { ShopifyIntegration } from "../integrations/Shopify.js";
 import { DarazIntegration } from "../integrations/Daraz.js";
 import { pushProductToDarazForCompany } from "../services/darazProductPush.js";
+import { withPersistedDarazCredentials } from "../services/darazCredentialService.js";
 import {
   getStockAlertSummaryForTenant,
   markStockAlertsRead,
@@ -37,6 +39,7 @@ import {
   normalizeProductText,
   normalizeSku,
 } from "../utils/productTextFormatting.js";
+import { withShopifyChannelSkus } from "../utils/channelSkus.js";
 
 async function normalizeDarazCredentials(credentials) {
   const creds = { ...(credentials || {}) };
@@ -569,7 +572,7 @@ router.get("/company-integrations", async (req, res) => {
           integration_id: ci.integration_id,
           integration_name: integration?.name || "Unknown",
           integration_slug: integration?.slug || "",
-          credentials: ci.credentials || {},
+          credentials: decryptStoredCredentials(ci.credentials || {}),
           status: ci.status === 1 ? 1 : 0,
           features,
           created_at: ci.created_at,
@@ -615,7 +618,7 @@ router.post("/company-integrations", async (req, res) => {
     const doc = {
       company_id,
       integration_id,
-      credentials: creds,
+      credentials: encryptCredentialTree(creds),
       status: status === 1 ? 1 : 0,
       features: normalizedFeatures,
       created_at: new Date(),
@@ -647,7 +650,7 @@ router.post("/company-integrations", async (req, res) => {
       integration_id,
       integration_name: integration.name,
       integration_slug: integration.slug,
-      credentials: doc.credentials,
+      credentials: creds,
       status: doc.status,
       features: normalizedFeatures,
       created_at: doc.created_at,
@@ -699,7 +702,7 @@ router.put("/company-integrations/:id", async (req, res) => {
           creds = await normalizeDarazCredentials(creds);
         }
       }
-      update.credentials = creds;
+      update.credentials = encryptCredentialTree(creds);
     }
     if (status !== undefined) update.status = status === 1 ? 1 : 0;
     if (features !== undefined) update.features = normalizeIntegrationFeatures(features);
@@ -726,7 +729,7 @@ router.put("/company-integrations/:id", async (req, res) => {
       integration_id: result.integration_id,
       integration_name: integration?.name || "Unknown",
       integration_slug: integration?.slug || "",
-      credentials: result.credentials || {},
+      credentials: decryptStoredCredentials(result.credentials || {}),
       status: result.status,
       features: featuresOut,
       created_at: result.created_at,
@@ -908,7 +911,8 @@ async function pushProductToShopifyForCompany(tenantDb, product, productId) {
     };
   }
 
-  const pushResult = await ShopifyIntegration.createProduct(ci.credentials, {
+  const pid = productId instanceof ObjectId ? productId : new ObjectId(productId);
+  const shopifyProduct = withShopifyChannelSkus({
     title: product.title,
     description: product.description,
     product_type: product.product_type,
@@ -923,12 +927,12 @@ async function pushProductToShopifyForCompany(tenantDb, product, productId) {
     images: product.images,
     sizes: product.sizes,
     variants: product.variants,
-  });
+  }, pid);
+  const pushResult = await ShopifyIntegration.createProduct(ci.credentials, shopifyProduct);
   if (!pushResult?.external_id) {
     return { warning: "Shopify did not return a product id." };
   }
 
-  const pid = productId instanceof ObjectId ? productId : new ObjectId(productId);
   const productsColl = tenantDb.collection("products");
   const cpColl = tenantDb.collection("channel_products");
   const darazCp = await cpColl.findOne({ product_id: pid, channel_name: "daraz" });
@@ -952,6 +956,8 @@ async function pushProductToShopifyForCompany(tenantDb, product, productId) {
         channel_product_id: pushResult.channel_product_id || pushResult.external_id,
         channel_variant_id: pushResult.channel_variant_id || null,
         channel_inventory_item_id: pushResult.channel_inventory_item_id || null,
+        channel_sku: pushResult.channel_sku || shopifyProduct.sku || shopifyProduct.variants?.[0]?.sku || null,
+        channel_variants: pushResult.channel_variants || [],
         updated_at: new Date(),
       },
     },
@@ -996,7 +1002,8 @@ async function updateShopifyProductForCompany(tenantDb, product, channelMapping)
   const updateResult = await ShopifyIntegration.updateProduct(
     ci.credentials,
     channelProductId,
-    product
+    product,
+    channelMapping
   );
   return { categoryWarning: updateResult.categoryWarning || null };
 }
@@ -1066,7 +1073,7 @@ router.get("/products", async (req, res) => {
       price_asc: { price: 1 },
       price_desc: { price: -1 },
     };
-    const sortOrder = sortOpts[sortParam] || sortOpts.newest;
+    const sortOrder = { ...(sortOpts[sortParam] || sortOpts.newest), _id: -1 };
     const cursor = tenantDb
       .collection("products")
       .find(filter)
@@ -1247,7 +1254,8 @@ router.post("/products/standardize-text", async (req, res) => {
           const shopifyResult = await ShopifyIntegration.updateProduct(
             companyIntegration.credentials,
             channelProductId,
-            normalized
+            normalized,
+            shopifyMapping
           );
           result.shopify_updated += 1;
           if (shopifyResult.categoryWarning && result.errors.length < 50) {
@@ -1533,7 +1541,7 @@ router.post("/products", async (req, res) => {
         });
         if (ci && ci.credentials) {
           try {
-            const pushResult = await ShopifyIntegration.createProduct(ci.credentials, {
+            const shopifyProduct = withShopifyChannelSkus({
               title: created.title,
               description: created.description,
               product_type: created.product_type,
@@ -1548,7 +1556,8 @@ router.post("/products", async (req, res) => {
               images: created.images,
               sizes: created.sizes,
               variants: created.variants,
-            });
+            }, result.insertedId);
+            const pushResult = await ShopifyIntegration.createProduct(ci.credentials, shopifyProduct);
             if (pushResult?.external_id) {
               external_id = pushResult.external_id;
               productSource = "shopify";
@@ -1565,6 +1574,8 @@ router.post("/products", async (req, res) => {
                     channel_product_id: pushResult.channel_product_id || pushResult.external_id,
                     channel_variant_id: pushResult.channel_variant_id || null,
                     channel_inventory_item_id: pushResult.channel_inventory_item_id || null,
+                    channel_sku: pushResult.channel_sku || shopifyProduct.sku || shopifyProduct.variants?.[0]?.sku || null,
+                    channel_variants: pushResult.channel_variants || [],
                     updated_at: new Date(),
                   },
                 },
@@ -2218,12 +2229,20 @@ router.patch("/inventory/:product_id", async (req, res) => {
           if (!darazCp || !darazCi?.credentials) return;
           try {
             const darazCreds = await DarazIntegration.ensureAccessToken(darazCi.credentials);
-            const setResult = await DarazIntegration.setInventory(darazCreds, {
-              sellerSku: darazCp.channel_seller_sku || product.sku || "",
-              skuId: darazCp.channel_variant_id || "",
-              quantity: updated.quantity,
-              price: product.price != null ? product.price : undefined,
-            });
+            const setResult = await withPersistedDarazCredentials(
+              ciColl,
+              darazCi,
+              darazCreds,
+              () =>
+                DarazIntegration.setInventory(darazCreds, {
+                  sellerSku: darazCp.channel_variant_id
+                    ? undefined
+                    : darazCp.channel_seller_sku || product.sku || "",
+                  skuId: darazCp.channel_variant_id || undefined,
+                  quantity: updated.quantity,
+                  price: product.price != null ? product.price : undefined,
+                })
+            );
             if (!setResult.success) console.error("[Daraz] Inventory sync after PATCH failed:", setResult.error);
           } catch (e) {
             console.error("[Daraz] Inventory sync after PATCH failed:", e?.message);
@@ -2645,7 +2664,7 @@ router.get("/carrier-integrations", async (req, res) => {
           carrier_name: carrier?.name ?? "Unknown",
           carrier_slug: carrier?.slug || "",
           credentials_schema: carrier?.credentials_schema || [],
-          credentials: ci.credentials || {},
+          credentials: decryptStoredCredentials(ci.credentials || {}),
           status: ci.status === 1 ? 1 : 0,
           created_at: ci.created_at,
           updated_at: ci.updated_at,
@@ -2676,7 +2695,7 @@ router.post("/carrier-integrations", async (req, res) => {
     const carrierIntegrations = tenantDb.collection("carrier_integrations");
     const doc = {
       carrier_id,
-      credentials: credentials || {},
+      credentials: encryptCredentialTree(credentials || {}),
       status: status === 1 ? 1 : 0,
       created_at: new Date(),
       updated_at: new Date(),
@@ -2688,7 +2707,7 @@ router.post("/carrier-integrations", async (req, res) => {
       carrier_name: carrier.name,
       carrier_slug: carrier.slug,
       credentials_schema: carrier.credentials_schema || [],
-      credentials: doc.credentials,
+      credentials: credentials || {},
       status: doc.status,
       created_at: doc.created_at,
       updated_at: doc.updated_at,
@@ -2714,7 +2733,7 @@ router.put("/carrier-integrations/:id", async (req, res) => {
     const tenantDb = await getTenantDb(tenantName);
     const carrierIntegrations = tenantDb.collection("carrier_integrations");
     const update = { updated_at: new Date() };
-    if (credentials !== undefined) update.credentials = credentials;
+    if (credentials !== undefined) update.credentials = encryptCredentialTree(credentials);
     if (status !== undefined) update.status = status === 1 ? 1 : 0;
     const result = await carrierIntegrations.findOneAndUpdate(
       { _id: oid },
@@ -2733,7 +2752,7 @@ router.put("/carrier-integrations/:id", async (req, res) => {
       carrier_name: carrier?.name ?? "Unknown",
       carrier_slug: carrier?.slug || "",
       credentials_schema: carrier?.credentials_schema || [],
-      credentials: result.credentials || {},
+      credentials: decryptStoredCredentials(result.credentials || {}),
       status: result.status,
       created_at: result.created_at,
       updated_at: result.updated_at,
@@ -2813,12 +2832,21 @@ router.get("/carrier-integration-services", async (req, res) => {
     const tenantDb = await getTenantDb(tenantName);
     const authDb = await getAuthDb();
     const servicesColl = authDb.collection("carrier_services");
-    const filter = carrierIntegrationId ? { carrier_integration_id: carrierIntegrationId } : {};
-    const list = await tenantDb
+    const storedList = await tenantDb
       .collection("carrier_integration_services")
-      .find(filter)
+      .find({})
       .sort({ created_at: -1 })
       .toArray();
+    const list = storedList
+      .map((cis) => ({
+        ...cis,
+        ...decryptStoredCredentials({
+          carrier_integration_id: cis.carrier_integration_id,
+          carrier_service_id: cis.carrier_service_id,
+        }),
+      }))
+      .filter((cis) => !carrierIntegrationId ||
+        String(cis.carrier_integration_id ?? "") === String(carrierIntegrationId));
     const withService = await Promise.all(
       list.map(async (cis) => {
         const svcOid = toObjectId(cis.carrier_service_id);
@@ -2860,13 +2888,20 @@ router.post("/carrier-integration-services", async (req, res) => {
       return res.status(400).json({ error: "Carrier service not found" });
     }
     const coll = tenantDb.collection("carrier_integration_services");
-    const existing = await coll.findOne({ carrier_integration_id, carrier_service_id });
+    const links = await coll.find({}).toArray();
+    const existing = links.some((link) => {
+      const decrypted = decryptStoredCredentials({
+        carrier_integration_id: link.carrier_integration_id,
+        carrier_service_id: link.carrier_service_id,
+      });
+      return String(decrypted.carrier_integration_id ?? "") === String(carrier_integration_id) &&
+        String(decrypted.carrier_service_id ?? "") === String(carrier_service_id);
+    });
     if (existing) {
       return res.status(400).json({ error: "This service is already linked to this carrier integration" });
     }
     const doc = {
-      carrier_integration_id,
-      carrier_service_id,
+      ...encryptCredentialTree({ carrier_integration_id, carrier_service_id }),
       created_at: new Date(),
       updated_at: new Date(),
     };
@@ -2908,12 +2943,16 @@ router.put("/carrier-integration-services/:id", async (req, res) => {
       return res.status(404).json({ error: "Carrier integration service not found" });
     }
     const authDb = await getAuthDb();
-    const svcOid = toObjectId(result.carrier_service_id);
+    const linkIds = decryptStoredCredentials({
+      carrier_integration_id: result.carrier_integration_id,
+      carrier_service_id: result.carrier_service_id,
+    });
+    const svcOid = toObjectId(linkIds.carrier_service_id);
     const svc = svcOid ? await authDb.collection("carrier_services").findOne({ _id: svcOid }) : null;
     return res.json({
       id: result._id.toString(),
-      carrier_integration_id: result.carrier_integration_id?.toString ? result.carrier_integration_id.toString() : String(result.carrier_integration_id ?? ""),
-      carrier_service_id: result.carrier_service_id?.toString ? result.carrier_service_id.toString() : String(result.carrier_service_id ?? ""),
+      carrier_integration_id: linkIds.carrier_integration_id?.toString ? linkIds.carrier_integration_id.toString() : String(linkIds.carrier_integration_id ?? ""),
+      carrier_service_id: linkIds.carrier_service_id?.toString ? linkIds.carrier_service_id.toString() : String(linkIds.carrier_service_id ?? ""),
       carrier_service_name: svc?.name ?? "Unknown",
       carrier_service_code: svc?.code || "",
       created_at: result.created_at,

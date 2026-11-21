@@ -1,3 +1,5 @@
+import { decryptStoredCredentials } from "../db/credentialEncryption.js";
+
 /**
  * Leopard Courier (Pakistan) – Merchant API bookPacket.
  * URL and body only as provided: no extra credentials or URL variants.
@@ -30,6 +32,7 @@ function sanitizeBody(body) {
  */
 
 function normalizeCredentials(credentials) {
+  credentials = decryptStoredCredentials(credentials);
   if (!credentials || typeof credentials !== "object") {
     return { apiKey: "", apiPassword: "", originCityId: null, destinationCityId: null };
   }

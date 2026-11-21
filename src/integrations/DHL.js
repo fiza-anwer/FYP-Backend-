@@ -1,3 +1,5 @@
+import { decryptStoredCredentials } from "../db/credentialEncryption.js";
+
 /**
  * DHL Express integration (MyDHL API).
  *
@@ -50,6 +52,7 @@ function extractBaseUrl(value) {
 }
 
 function normalizeCredentials(credentials) {
+  credentials = decryptStoredCredentials(credentials);
   if (!credentials) {
     return { username: "", password: "", accountNumber: "", baseUrl: DEFAULT_BASE_URL };
   }

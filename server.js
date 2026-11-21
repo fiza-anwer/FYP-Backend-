@@ -8,6 +8,7 @@ import cors from "cors";
 import cookieParser from "cookie-parser";
 import cron from "node-cron";
 import { connectMongo } from "./src/db/mongo.js";
+import { getFieldEncryptionKey } from "./src/db/credentialEncryption.js";
 import { config } from "./src/config.js";
 import tenantRouter from "./src/routes/tenant.js";
 import authRouter from "./src/routes/auth.js";
@@ -103,6 +104,7 @@ cron.schedule("*/15 * * * *", async () => {
 });
 
 async function start() {
+  getFieldEncryptionKey();
   await connectMongo();
   console.log("MongoDB connected");
   if (process.env.GOOGLE_CLIENT_ID) {

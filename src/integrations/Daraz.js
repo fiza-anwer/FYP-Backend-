@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   exchangeAuthorizationCode,
   refreshAuthorizationToken,
@@ -8,6 +9,11 @@ import {
   updateProductPriceQuantity,
 } from "./darazApi.js";
 import { createDarazProduct } from "./darazProductCreate.js";
+import { decryptStoredCredentials } from "../db/credentialEncryption.js";
+
+const refreshResults = new Map();
+const REFRESH_RESULT_TTL_MS = 30_000;
+const REFRESH_FAILURE_TTL_MS = 5_000;
 
 function mapDarazProduct(item) {
   const skus = Array.isArray(item?.skus) ? item.skus : [];
@@ -119,12 +125,34 @@ export class DarazIntegration {
         "Daraz access token expired and no refresh token is stored. Connect Daraz again in Company Integrations."
       );
     }
-    const data = await refreshAuthorizationToken(refresh);
-    return tokenFieldsFromDaraz(data, { refresh_token: refresh });
+    const cacheKey = createHash("sha256").update(refresh).digest("hex");
+    const now = Date.now();
+    for (const [key, result] of refreshResults) {
+      if (result.expiresAt <= now) refreshResults.delete(key);
+    }
+    const cached = refreshResults.get(cacheKey);
+    if (cached) return cached.promise;
+
+    console.warn("[Daraz] access_token rejected; refreshing…");
+    const result = { expiresAt: Number.POSITIVE_INFINITY };
+    result.promise = refreshAuthorizationToken(refresh)
+      .then((data) => tokenFieldsFromDaraz(data, { refresh_token: refresh }))
+      .then(
+        (credentials) => {
+          result.expiresAt = Date.now() + REFRESH_RESULT_TTL_MS;
+          return credentials;
+        },
+        (error) => {
+          result.expiresAt = Date.now() + REFRESH_FAILURE_TTL_MS;
+          throw error;
+        }
+      );
+    refreshResults.set(cacheKey, result);
+    return result.promise;
   }
 
   static async ensureAccessToken(credentials) {
-    const creds = credentials || {};
+    const creds = decryptStoredCredentials(credentials || {});
     const code = typeof creds.authorization_code === "string" ? creds.authorization_code.trim() : "";
     if (code) {
       const exchanged = await DarazIntegration.exchangeCode(code);
@@ -151,14 +179,40 @@ export class DarazIntegration {
     try {
       return await fn(creds.access_token);
     } catch (err) {
-      if (!DarazIntegration.isAccessTokenError(err) || !String(creds.refresh_token || "").trim()) {
-        throw err;
+      if (!DarazIntegration.isAccessTokenError(err)) throw err;
+      if (!String(creds.refresh_token || "").trim()) {
+        throw new Error(
+          "Daraz access token is invalid or expired and no refresh token is available. Reconnect Daraz in Company Integrations."
+        );
       }
-      console.warn("[Daraz] access_token rejected; refreshing…");
-      const refreshed = await DarazIntegration.refreshToken(creds);
+      let refreshed;
+      try {
+        refreshed = await DarazIntegration.refreshToken(creds);
+      } catch (refreshError) {
+        if (DarazIntegration.isAccessTokenError(refreshError)) {
+          throw new Error(
+            "Daraz authorization could not be refreshed. Reconnect Daraz in Company Integrations."
+          );
+        }
+        throw refreshError;
+      }
+      if (refreshed.access_token === creds.access_token) {
+        throw new Error(
+          "Daraz returned the same rejected access token. Reconnect Daraz in Company Integrations."
+        );
+      }
       creds = { ...creds, ...refreshed };
       Object.assign(credentials, creds);
-      return await fn(creds.access_token);
+      try {
+        return await fn(creds.access_token);
+      } catch (retryError) {
+        if (DarazIntegration.isAccessTokenError(retryError)) {
+          throw new Error(
+            "Daraz rejected its refreshed access token. Reconnect Daraz in Company Integrations."
+          );
+        }
+        throw retryError;
+      }
     }
   }
 
@@ -208,6 +262,7 @@ export class DarazIntegration {
               const itemData = await fetchOrderItems(accessToken, orderId);
               items = Array.isArray(itemData) ? itemData : itemData.order_items || [];
             } catch (err) {
+              if (DarazIntegration.isAccessTokenError(err)) throw err;
               console.warn("[Daraz] order items fetch failed for", orderId, err.message);
             }
           }
@@ -256,8 +311,10 @@ export class DarazIntegration {
    * Create a new listing on Daraz (category, attributes, images, SKU).
    */
   static async createProduct(credentials, product) {
-    const creds = await DarazIntegration.ensureAccessToken(credentials);
-    return createDarazProduct(creds.access_token, product);
+    const creds = credentials || {};
+    return DarazIntegration.withRefreshedAccess(creds, (accessToken) =>
+      createDarazProduct(accessToken, product)
+    );
   }
 
   /**
@@ -292,8 +349,8 @@ export class DarazIntegration {
     const price = product.price != null ? product.price : product.variants?.[0]?.price;
 
     const result = await DarazIntegration.setInventory(credentials, {
-      sellerSku: sellerSku || undefined,
-      skuId: sellerSku ? undefined : skuId || undefined,
+      sellerSku: skuId ? undefined : sellerSku || undefined,
+      skuId: skuId || undefined,
       quantity: qty,
       price,
     });
@@ -306,7 +363,7 @@ export class DarazIntegration {
       external_id: existingItemId,
       channel_product_id: existingItemId,
       channel_variant_id: skuId || null,
-      channel_seller_sku: sellerSku || null,
+      channel_seller_sku: channelMapping.channel_seller_sku || sellerSku || null,
       created: false,
     };
   }

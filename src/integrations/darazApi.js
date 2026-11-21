@@ -117,9 +117,7 @@ function escapeXml(s) {
     .replace(/"/g, "&quot;");
 }
 
-/**
- * POST to Daraz/Lazada Open Platform (all params including `payload` in signed query string).
- */
+/** POST to Daraz/Lazada Open Platform with business parameters in a multipart form body. */
 export async function darazPost(apiPath, businessParams = {}, accessToken = null) {
   const key = appKey();
   const secret = appSecret();
@@ -127,19 +125,22 @@ export async function darazPost(apiPath, businessParams = {}, accessToken = null
     throw new Error("Daraz API not configured: set DARAZ_APP_KEY and DARAZ_APP_SECRET in .env");
   }
 
-  const params = {
+  const systemParams = {
     app_key: key,
     sign_method: "sha256",
     timestamp: String(Date.now()),
-    ...businessParams,
   };
-  if (accessToken) params.access_token = accessToken;
+  if (accessToken) systemParams.access_token = accessToken;
 
-  const sign = signRequest(apiPath, params, secret);
-  const qs = new URLSearchParams({ ...params, sign });
+  const sign = signRequest(apiPath, { ...systemParams, ...businessParams }, secret);
+  const qs = new URLSearchParams({ ...systemParams, sign });
   const url = `${API_ROOT}${apiPath}?${qs.toString()}`;
+  const body = new FormData();
+  for (const [name, value] of Object.entries(businessParams)) {
+    if (value !== undefined && value !== null) body.append(name, String(value));
+  }
 
-  const res = await fetch(url, { method: "POST" });
+  const res = await fetch(url, { method: "POST", body });
   const text = await res.text();
   let json;
   try {

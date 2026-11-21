@@ -4,6 +4,7 @@ import { getTenantDb, tenantDbExists } from "../db/tenantDb.js";
 import { ShopifyIntegration } from "../integrations/Shopify.js";
 import { DarazIntegration } from "../integrations/Daraz.js";
 import { forEachConcurrent } from "./forEachConcurrent.js";
+import { withPersistedDarazCredentials } from "./darazCredentialService.js";
 
 const BATCH_LIMIT = 200;
 const MAX_CONCURRENT_SYNC = 3;
@@ -16,6 +17,7 @@ async function syncOneChannelMapping({
   inv,
   activeCis,
   integrationsBySlug,
+  companyIntegrationsColl,
   inventoryInterfacesColl,
   interfaceByCiId,
   logsColl,
@@ -60,14 +62,19 @@ async function syncOneChannelMapping({
           quantity
         );
       } else if (channelName === "daraz") {
-        let credentials = ci.credentials;
-        credentials = await DarazIntegration.ensureAccessToken(credentials);
-        result = await DarazIntegration.setInventory(credentials, {
-          sellerSku: cp.channel_seller_sku || product.sku || "",
-          skuId: cp.channel_variant_id || "",
-          quantity,
-          price: product.price != null ? product.price : undefined,
-        });
+        const credentials = await DarazIntegration.ensureAccessToken(ci.credentials);
+        result = await withPersistedDarazCredentials(
+          companyIntegrationsColl,
+          ci,
+          credentials,
+          () =>
+            DarazIntegration.setInventory(credentials, {
+              sellerSku: cp.channel_variant_id ? undefined : cp.channel_seller_sku || product.sku || "",
+              skuId: cp.channel_variant_id || undefined,
+              quantity,
+              price: product.price != null ? product.price : undefined,
+            })
+        );
       } else {
         return { synced: false, error: `Unsupported channel: ${channelName}` };
       }
@@ -195,6 +202,7 @@ export async function syncInventoryToChannelsForTenant(tenantName) {
       inv,
       activeCis,
       integrationsBySlug,
+      companyIntegrationsColl,
       inventoryInterfacesColl,
       interfaceByCiId,
       logsColl,

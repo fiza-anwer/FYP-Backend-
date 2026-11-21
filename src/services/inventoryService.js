@@ -1,4 +1,5 @@
 import { ObjectId } from "mongodb";
+import { withPersistedDarazCredentials } from "./darazCredentialService.js";
 
 /**
  * Ensure an inventory document exists for a product (create with quantity 0, allocated 0 if missing).
@@ -171,13 +172,21 @@ export async function syncProductInventoryToChannels(tenantDb, product, quantity
       });
       if (darazCi?.credentials) {
         try {
-          let darazCreds = await DarazIntegration.ensureAccessToken(darazCi.credentials);
-          const setResult = await DarazIntegration.setInventory(darazCreds, {
-            sellerSku: darazCp.channel_seller_sku || product.sku || "",
-            skuId: darazCp.channel_variant_id || "",
-            quantity: qty,
-            price: product.price != null ? product.price : undefined,
-          });
+          const darazCreds = await DarazIntegration.ensureAccessToken(darazCi.credentials);
+          const setResult = await withPersistedDarazCredentials(
+            ciColl,
+            darazCi,
+            darazCreds,
+            () =>
+              DarazIntegration.setInventory(darazCreds, {
+                sellerSku: darazCp.channel_variant_id
+                  ? undefined
+                  : darazCp.channel_seller_sku || product.sku || "",
+                skuId: darazCp.channel_variant_id || undefined,
+                quantity: qty,
+                price: product.price != null ? product.price : undefined,
+              })
+          );
           if (!setResult.success) {
             console.error("[Daraz] Inventory sync after product save failed:", setResult.error);
           }

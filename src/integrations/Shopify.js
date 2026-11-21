@@ -1,3 +1,5 @@
+import { decryptStoredCredentials } from "../db/credentialEncryption.js";
+
 /**
  * Shopify integration: fetch orders from store via Admin API.
  * credentials: { shop_domain, access_token } or { shop, x_shopify_token } etc.
@@ -131,6 +133,7 @@ async function setProductCategoryViaGraphQL(shop_domain, access_token, shopifyPr
 
 /** Normalize credentials so we accept various keys used in UI/DB (access_token, x-shopify-token, shop_domain, shop, etc.). */
 function normalizeShopifyCredentials(credentials) {
+  credentials = decryptStoredCredentials(credentials);
   if (!credentials || typeof credentials !== "object") {
     return { shop_domain: "", access_token: "" };
   }
@@ -342,10 +345,25 @@ export class ShopifyIntegration {
         categoryWarning = err.message || "Category could not be set in Shopify.";
       }
     }
-    const firstVariant = Array.isArray(created.variants) && created.variants[0] ? created.variants[0] : null;
+    const createdVariants = Array.isArray(created.variants) ? created.variants : [];
+    const firstVariant = createdVariants[0] || null;
     const channel_product_id = String(created.id);
     const channel_variant_id = firstVariant?.id ? String(firstVariant.id) : null;
     const channel_inventory_item_id = firstVariant?.inventory_item_id ? String(firstVariant.inventory_item_id) : null;
+    const channel_variants = createdVariants.map((variant, index) => ({
+      internal_sku: String(
+        variants[index]?.internal_sku ||
+          variants[index]?.sku ||
+          product.internal_sku ||
+          product.sku ||
+          ""
+      ).trim(),
+      channel_sku: String(variant?.sku || shopifyVariants[index]?.sku || "").trim() || null,
+      channel_variant_id: variant?.id ? String(variant.id) : null,
+      channel_inventory_item_id: variant?.inventory_item_id
+        ? String(variant.inventory_item_id)
+        : null,
+    }));
     return {
       external_id: channel_product_id,
       raw: created,
@@ -353,10 +371,12 @@ export class ShopifyIntegration {
       channel_product_id,
       channel_variant_id,
       channel_inventory_item_id,
+      channel_sku: channel_variants[0]?.channel_sku || null,
+      channel_variants,
     };
   }
 
-  static async updateProduct(credentials, productId, product) {
+  static async updateProduct(credentials, productId, product, channelMapping = {}) {
     const { shop_domain, access_token } = normalizeShopifyCredentials(credentials);
     const id = String(productId ?? "").trim();
     if (!shop_domain || !access_token) {
@@ -381,10 +401,36 @@ export class ShopifyIntegration {
       ? currentData.product.variants
       : [];
     const localVariants = Array.isArray(product.variants) ? product.variants : [];
+    const mappedVariants = Array.isArray(channelMapping.channel_variants)
+      ? channelMapping.channel_variants
+      : [];
     const matchedVariantIds = new Set();
+    const matchedMappingIndexes = new Set();
     const variantUpdates = localVariants.flatMap((variant, index) => {
-      const sku = String(variant?.sku ?? "").trim();
+      const internalSku = String(variant?.sku ?? "").trim();
+      let mappedIndex = mappedVariants.findIndex(
+        (candidate, candidateIndex) =>
+          !matchedMappingIndexes.has(candidateIndex) &&
+          candidate?.internal_sku &&
+          String(candidate.internal_sku).trim() === internalSku
+      );
+      if (mappedIndex < 0 && index < mappedVariants.length && !matchedMappingIndexes.has(index)) {
+        mappedIndex = index;
+      }
+      const mappedVariant = mappedIndex >= 0 ? mappedVariants[mappedIndex] : null;
+      if (mappedIndex >= 0) matchedMappingIndexes.add(mappedIndex);
+      const mappedVariantId =
+        mappedVariant?.channel_variant_id != null
+          ? String(mappedVariant.channel_variant_id)
+          : "";
+      const sku = String(mappedVariant?.channel_sku || variant?.sku || "").trim();
       const remote =
+        (mappedVariantId &&
+          currentVariants.find(
+            (candidate) =>
+              !matchedVariantIds.has(String(candidate.id)) &&
+              String(candidate.id) === mappedVariantId
+          )) ||
         (sku &&
           currentVariants.find(
             (candidate) =>
@@ -398,8 +444,8 @@ export class ShopifyIntegration {
       if (!remote?.id) return [];
       matchedVariantIds.add(String(remote.id));
       const update = { id: remote.id };
-      if (variant?.sku != null && String(variant.sku) !== String(remote.sku ?? "")) {
-        update.sku = variant.sku;
+      if (sku && sku !== String(remote.sku ?? "")) {
+        update.sku = sku;
       }
       if (variant?.option1 != null && String(variant.option1) !== String(remote.option1 ?? "")) {
         update.option1 = variant.option1;

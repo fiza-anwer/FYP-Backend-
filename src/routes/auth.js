@@ -7,6 +7,7 @@ import { config } from "../config.js";
 import { authMiddleware } from "../middleware/auth.js";
 import { getStockAlertSummaryForTenant } from "../services/stockAlertService.js";
 import {
+  AUTH_SESSION_TTL_MS,
   createAuthenticatedSession,
   createToken,
   hashToken,
@@ -202,6 +203,7 @@ router.post("/login", async (req, res) => {
       await superadminsCol.updateOne({ _id: superadmin._id }, { $set: { last_login_at: new Date() } });
       return res.json({
         token: session.token,
+        expires_at: session.expiresAt,
         user: {
           email: em,
           name: superadmin.name || superadmin.username || em,
@@ -246,6 +248,7 @@ router.post("/login", async (req, res) => {
     }
     return res.json({
       token: session.token,
+      expires_at: session.expiresAt,
       user: {
         email: em,
         name: tenantUser.name || tenant.tenant_name,
@@ -268,8 +271,14 @@ router.post("/login", async (req, res) => {
 router.get("/sessions", authMiddleware, async (req, res) => {
   try {
     const db = await getAuthDb();
+    const activeSince = new Date(Date.now() - AUTH_SESSION_TTL_MS);
     const sessions = await db.collection("auth_sessions")
-      .find({ user_key: req.user.sub, expires_at: { $gt: new Date() }, revoked_at: { $exists: false } })
+      .find({
+        user_key: req.user.sub,
+        created_at: { $gt: activeSince },
+        expires_at: { $gt: new Date() },
+        revoked_at: { $exists: false },
+      })
       .sort({ last_seen_at: -1 })
       .project({ user_agent: 1, ip_address: 1, created_at: 1, last_seen_at: 1, expires_at: 1 })
       .toArray();
@@ -310,6 +319,23 @@ router.delete("/sessions/current", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("Revoke current session error:", err);
     return res.status(500).json({ error: "Unable to end this session" });
+  }
+});
+
+router.delete("/sessions/:sessionId", authMiddleware, async (req, res) => {
+  try {
+    const db = await getAuthDb();
+    const result = await db.collection("auth_sessions").deleteOne({
+      _id: req.params.sessionId,
+      user_key: req.user.sub,
+    });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: "Session not found or already signed out." });
+    }
+    return res.json({ revoked: true });
+  } catch (err) {
+    console.error("Revoke selected session error:", err);
+    return res.status(500).json({ error: "Unable to sign out this session" });
   }
 });
 
@@ -1125,6 +1151,7 @@ router.patch("/profile", authMiddleware, async (req, res) => {
         }))?.new_email || "";
     return res.json({
       token: refreshedSession?.token,
+      expires_at: refreshedSession?.expiresAt,
       pending_email: currentPendingEmail || undefined,
       password_notice_sent: passwordChanged ? passwordNoticeSent : undefined,
       user: {

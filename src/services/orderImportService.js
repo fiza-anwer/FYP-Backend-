@@ -1,9 +1,11 @@
 import { ObjectId } from "mongodb";
 import { getAuthDb } from "../db/authDb.js";
 import { getTenantDb, tenantDbExists } from "../db/tenantDb.js";
+import { decryptStoredCredentials } from "../db/credentialEncryption.js";
 import { increaseAllocatedForOrderLineItems } from "./inventoryService.js";
 import { ShopifyIntegration } from "../integrations/Shopify.js";
 import { DarazIntegration } from "../integrations/Daraz.js";
+import { withPersistedDarazCredentials } from "./darazCredentialService.js";
 
 const INTEGRATION_CLASSES = {
   shopify: ShopifyIntegration,
@@ -44,17 +46,19 @@ export async function runOrderImportForTenant(tenantName) {
       continue;
     }
     try {
-      let credentials = ci.credentials || {};
+      let credentials = decryptStoredCredentials(ci.credentials || {});
       if (slug === "daraz") {
         credentials = await DarazIntegration.ensureAccessToken(credentials);
-        if (credentials.access_token && credentials.access_token !== ci.credentials?.access_token) {
-          await companyIntegrations.updateOne(
-            { _id: ci._id },
-            { $set: { credentials, updated_at: new Date() } }
-          );
-        }
       }
-      const orders = await Klass.fetchOrders(credentials);
+      const orders =
+        slug === "daraz"
+          ? await withPersistedDarazCredentials(
+              companyIntegrations,
+              ci,
+              credentials,
+              () => Klass.fetchOrders(credentials)
+            )
+          : await Klass.fetchOrders(credentials);
       totalFetched += orders.length;
       const companyOid = ci.company_id ? (typeof ci.company_id === "string" ? new ObjectId(ci.company_id) : ci.company_id) : null;
       for (const order of orders) {
