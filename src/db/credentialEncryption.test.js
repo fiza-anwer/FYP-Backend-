@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createCipheriv, randomBytes } from "node:crypto";
 import {
   decryptCredentialTree,
+  decryptCredentialTreeWithKeys,
   decryptStoredCredentials,
   encryptCredentialTree,
   getFieldEncryptionKey,
@@ -47,6 +48,31 @@ test("rejects invalid keys and authenticated ciphertext", () => {
   const envelope = encryptFixture("secret", key);
   envelope.data = Buffer.from("tampered").toString("base64");
   assert.throws(() => decryptCredentialTree(envelope, key));
+});
+
+test("decrypts mixed-key credential trees with a keyring", () => {
+  const firstKey = randomBytes(32);
+  const secondKey = randomBytes(32);
+  const credentials = {
+    access_token: encryptFixture("token-value", firstKey),
+    password: encryptFixture("password-value", secondKey, true),
+    shop_name: "Store",
+  };
+  const stats = { decryptedValues: 0, decryptedByKey: [] };
+
+  assert.deepEqual(
+    decryptCredentialTreeWithKeys(credentials, [firstKey, secondKey], stats),
+    {
+      access_token: "token-value",
+      password: "password-value",
+      shop_name: "Store",
+    }
+  );
+  assert.deepEqual(stats.decryptedByKey, [1, 1]);
+  assert.throws(
+    () => decryptCredentialTreeWithKeys(credentials, [firstKey]),
+    /any configured source key/
+  );
 });
 
 test("encrypts requested credential fields and relation IDs while preserving other values", () => {

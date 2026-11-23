@@ -143,6 +143,46 @@ export function decryptCredentialTree(value, key, stats = { decryptedValues: 0 }
   );
 }
 
+export function decryptCredentialTreeWithKeys(
+  value,
+  keys,
+  stats = { decryptedValues: 0, decryptedByKey: [] }
+) {
+  if (!Array.isArray(keys) || keys.length === 0) {
+    throw new Error("At least one source key is required to decrypt stored credentials.");
+  }
+  if (!Array.isArray(stats.decryptedByKey) || stats.decryptedByKey.length !== keys.length) {
+    stats.decryptedByKey = Array(keys.length).fill(0);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => decryptCredentialTreeWithKeys(item, keys, stats));
+  }
+  if (!isPlainObject(value)) return value;
+
+  const payload = getPayload(value);
+  if (payload) {
+    for (let index = 0; index < keys.length; index += 1) {
+      try {
+        const plaintext = decryptEnvelope(payload, keys[index]);
+        stats.decryptedValues += 1;
+        stats.decryptedByKey[index] += 1;
+        return plaintext;
+      } catch {
+        // Try the next candidate key; authenticated decryption rejects incorrect keys.
+      }
+    }
+    throw new Error("Encrypted credential could not be authenticated with any configured source key.");
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).map(([field, fieldValue]) => [
+      field,
+      decryptCredentialTreeWithKeys(fieldValue, keys, stats),
+    ])
+  );
+}
+
 export function decryptStoredCredentials(value, key) {
   const containsEncryptedEnvelope = (item) => {
     if (Array.isArray(item)) return item.some(containsEncryptedEnvelope);
