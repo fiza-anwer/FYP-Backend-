@@ -25,6 +25,12 @@ import { DarazIntegration } from "../integrations/Daraz.js";
 import { pushProductToDarazForCompany } from "../services/darazProductPush.js";
 import { withPersistedDarazCredentials } from "../services/darazCredentialService.js";
 import {
+  normalizeDarazCredentials,
+  mergeDarazCredentials,
+  publicDarazCredentials,
+  darazAppCredentialsError,
+} from "../services/darazAppCredentials.js";
+import {
   getStockAlertSummaryForTenant,
   markStockAlertsRead,
 } from "../services/stockAlertService.js";
@@ -41,28 +47,28 @@ import {
 } from "../utils/productTextFormatting.js";
 import { withShopifyChannelSkus } from "../utils/channelSkus.js";
 
-async function normalizeDarazCredentials(credentials) {
-  const creds = { ...(credentials || {}) };
-  // Prefer a fresh OAuth code over a stored access_token (reconnect used to keep the expired token).
-  const code = typeof creds.authorization_code === "string" ? creds.authorization_code.trim() : "";
-  if (code) {
-    try {
-      const exchanged = await DarazIntegration.exchangeCode(code);
-      return {
-        ...creds,
-        ...exchanged,
-        authorization_code: "",
-      };
-    } catch (err) {
-      console.error("[Daraz] Token exchange failed:", err.message);
-      throw new Error(
-        "Daraz authorization code expired or invalid. Connect Daraz again in Company Integrations, then Save immediately."
-      );
-    }
-  }
-  if (creds.access_token) return creds;
-  return creds;
-}
+// async function normalizeDarazCredentials(credentials) {
+//   const creds = { ...(credentials || {}) };
+//   // Prefer a fresh OAuth code over a stored access_token (reconnect used to keep the expired token).
+//   const code = typeof creds.authorization_code === "string" ? creds.authorization_code.trim() : "";
+//   if (code) {
+//     try {
+//       const exchanged = await DarazIntegration.exchangeCode(code);
+//       return {
+//         ...creds,
+//         ...exchanged,
+//         authorization_code: "",
+//       };
+//     } catch (err) {
+//       console.error("[Daraz] Token exchange failed:", err.message);
+//       throw new Error(
+//         "Daraz authorization code expired or invalid. Connect Daraz again in Company Integrations, then Save immediately."
+//       );
+//     }
+//   }
+//   if (creds.access_token) return creds;
+//   return creds;
+// }
 
 /** Normalize string or ObjectId to ObjectId for reliable lookups (handles both DB storage formats). */
 function toObjectId(id) {
@@ -571,8 +577,13 @@ router.get("/company-integrations", async (req, res) => {
           company_name: company_name || null,
           integration_id: ci.integration_id,
           integration_name: integration?.name || "Unknown",
+          // integration_slug: integration?.slug || "",
+          // credentials: decryptStoredCredentials(ci.credentials || {}),
           integration_slug: integration?.slug || "",
-          credentials: decryptStoredCredentials(ci.credentials || {}),
+          credentials:
+            (integration?.slug || "").toLowerCase() === "daraz"
+              ? publicDarazCredentials(decryptStoredCredentials(ci.credentials || {}))
+              : decryptStoredCredentials(ci.credentials || {}),
           status: ci.status === 1 ? 1 : 0,
           features,
           created_at: ci.created_at,
