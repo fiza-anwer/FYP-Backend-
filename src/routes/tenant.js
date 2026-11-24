@@ -622,9 +622,11 @@ router.post("/company-integrations", async (req, res) => {
     const companyIntegrations = tenantDb.collection("company_integrations");
     const normalizedFeatures = normalizeIntegrationFeatures(features);
     const slug = (integration.slug || "shopify").toLowerCase();
-    let creds = credentials || {};
+        let creds = credentials || {};
     if (slug === "daraz") {
       creds = await normalizeDarazCredentials(creds);
+      const appError = darazAppCredentialsError(creds);
+      if (appError) return res.status(400).json({ error: appError });
     }
     const doc = {
       company_id,
@@ -661,7 +663,7 @@ router.post("/company-integrations", async (req, res) => {
       integration_id,
       integration_name: integration.name,
       integration_slug: integration.slug,
-      credentials: creds,
+      credentials: slug === "daraz" ? publicDarazCredentials(creds) : creds,
       status: doc.status,
       features: normalizedFeatures,
       created_at: doc.created_at,
@@ -710,6 +712,8 @@ router.put("/company-integrations/:id", async (req, res) => {
           _id: new ObjectId(existingCi.integration_id),
         });
         if ((intPre?.slug || "").toLowerCase() === "daraz") {
+          // The UI never receives app_secret/tokens, so blank values must keep the stored ones.
+          creds = mergeDarazCredentials(decryptStoredCredentials(existingCi.credentials || {}), creds);
           creds = await normalizeDarazCredentials(creds);
         }
       }
@@ -739,8 +743,11 @@ router.put("/company-integrations/:id", async (req, res) => {
       company_name,
       integration_id: result.integration_id,
       integration_name: integration?.name || "Unknown",
-      integration_slug: integration?.slug || "",
-      credentials: decryptStoredCredentials(result.credentials || {}),
+            integration_slug: integration?.slug || "",
+      credentials:
+        (integration?.slug || "").toLowerCase() === "daraz"
+          ? publicDarazCredentials(decryptStoredCredentials(result.credentials || {}))
+          : decryptStoredCredentials(result.credentials || {}),
       status: result.status,
       features: featuresOut,
       created_at: result.created_at,
