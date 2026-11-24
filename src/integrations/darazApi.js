@@ -1,13 +1,19 @@
 import crypto from "crypto";
+import { getDarazApp } from "./darazAppContext.js";
 
 const API_ROOT = (process.env.DARAZ_API_URL || "https://api.daraz.pk/rest").replace(/\/$/, "");
 
+const NOT_CONFIGURED_MESSAGE =
+  "Daraz API not configured: this company has no Daraz App Key/Secret and DARAZ_APP_KEY / DARAZ_APP_SECRET are not set on the server.";
+
+// The app used for signing comes from the company's credentials (see darazAppContext.js),
+// falling back to the DARAZ_APP_KEY / DARAZ_APP_SECRET env vars.
 function appKey() {
-  return process.env.DARAZ_APP_KEY || "";
+  return getDarazApp().key;
 }
 
 function appSecret() {
-  return process.env.DARAZ_APP_SECRET || "";
+  return getDarazApp().secret;
 }
 
 /** Lazada/Daraz Open Platform signature (HMAC-SHA256, hex upper). */
@@ -30,7 +36,7 @@ export async function darazGet(apiPath, businessParams = {}, accessToken = null)
   const key = appKey();
   const secret = appSecret();
   if (!key || !secret) {
-    throw new Error("Daraz API not configured: set DARAZ_APP_KEY and DARAZ_APP_SECRET in .env");
+    throw new Error(NOT_CONFIGURED_MESSAGE);
   }
 
   const params = {
@@ -122,7 +128,7 @@ export async function darazPost(apiPath, businessParams = {}, accessToken = null
   const key = appKey();
   const secret = appSecret();
   if (!key || !secret) {
-    throw new Error("Daraz API not configured: set DARAZ_APP_KEY and DARAZ_APP_SECRET in .env");
+    throw new Error(NOT_CONFIGURED_MESSAGE);
   }
 
   const systemParams = {
