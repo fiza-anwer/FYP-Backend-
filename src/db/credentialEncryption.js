@@ -9,6 +9,7 @@ const ENCRYPTED_FIELD_NAMES = new Set([
   "api_key",
   "api_password",
   "api_secret",
+  "app_secret",
   "authorization_code",
   "carrier_integration_id",
   "carrier_service_id",
