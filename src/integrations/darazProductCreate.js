@@ -12,6 +12,28 @@ function isMandatory(attr) {
   return attr?.is_mandatory === 1 || attr?.is_mandatory === true || attr?.is_mandatory === "1";
 }
 
+function isSizeChartAttribute(attr) {
+  return /size[\s_-]*chart/i.test(String(attr?.name || attr?.label || ""));
+}
+
+function isOuterIdAttribute(attr) {
+  const names = [
+    attr?.name,
+    attr?.label,
+    attr?.en_name,
+    attr?.name_en,
+    attr?.en_label,
+    attr?.label_en,
+    attr?.attribute_name,
+    attr?.attribute_label,
+    attr?.attribute_code,
+    attr?.id,
+  ];
+  return names.some(
+    (value) => String(value || "").trim().toLowerCase().replace(/[\s_-]/g, "") === "outerid"
+  );
+}
+
 function walkCategoryTree(nodes, path = []) {
   const out = [];
   for (const n of nodes || []) {
@@ -40,7 +62,6 @@ async function getCategoryLeaves(accessToken) {
  */
 export async function resolveDarazCategoryId(accessToken, productType = "") {
   const envDefault = (process.env.DARAZ_DEFAULT_CATEGORY_ID || "").trim();
-  if (envDefault) return envDefault;
 
   const leaves = await getCategoryLeaves(accessToken);
   const type = String(productType || "").trim().toLowerCase();
@@ -63,6 +84,10 @@ export async function resolveDarazCategoryId(accessToken, productType = "") {
   }
 
   const typeHint = String(productType || "").toLowerCase();
+  if (/perfume|fragrance|cologne|attar|ittar/i.test(typeHint)) {
+    const fragrance = leaves.find((l) => /fragrance|perfume|cologne/i.test(l.path));
+    if (fragrance) return fragrance.id;
+  }
   if (/jewell|ring|necklace|earring|locket|bracelet/i.test(typeHint)) {
     const jewellery = leaves.find((l) => /jewell/i.test(l.path));
     if (jewellery) return jewellery.id;
@@ -71,6 +96,8 @@ export async function resolveDarazCategoryId(accessToken, productType = "") {
     const apparel = leaves.find((l) => /fashion|clothing|apparel|wear/i.test(l.path));
     if (apparel) return apparel.id;
   }
+  if (envDefault) return envDefault;
+
   const fashion =
     leaves.find((l) => /fashion|jewell|accessories|women.*wear/i.test(l.path)) ||
     leaves.find((l) => /mobile accessories/i.test(l.path));
@@ -124,6 +151,9 @@ function pickEnumOption(attr, preferredTexts = []) {
 
 function pickAttributeValue(attr, product) {
   const tag = String(attr.name || "").trim();
+  if (isOuterIdAttribute(attr)) {
+    return String(product.sku || product.variants?.[0]?.sku || "").trim();
+  }
   const title = String(product.title || "").trim() || "Product";
   const desc =
     String(product.description || product.meta_description || "").trim() ||
@@ -246,7 +276,10 @@ export function buildDarazCreateProductXml(product, categoryId, attributes) {
   const skuAttrs = [];
   for (const a of attributes) {
     if (!a?.name) continue;
-    if (!isMandatory(a) && a.name !== "description") continue;
+    if (isSizeChartAttribute(a)) continue;
+    if (!isMandatory(a) && a.name !== "description") {
+      continue;
+    }
     if (a.attribute_type === "sku" || a.is_sale_prop === 1 || a.is_sale_prop === true) {
       skuAttrs.push(a);
     } else {
@@ -311,10 +344,9 @@ export async function createDarazProduct(accessToken, product) {
       "At least one public image URL (https://…) is required to list a new product on Daraz"
     );
   }
+  const attributes = await fetchCategoryAttributes(accessToken, categoryId);
   const darazImages = await migrateDarazImageUrls(accessToken, rawImages);
   const productForXml = { ...product, images: darazImages };
-
-  const attributes = await fetchCategoryAttributes(accessToken, categoryId);
   const xml = buildDarazCreateProductXml(productForXml, categoryId, attributes);
   const json = await darazPost("/product/create", { payload: xml }, accessToken);
   const data = json.data || json;

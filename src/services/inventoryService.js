@@ -179,9 +179,7 @@ export async function syncProductInventoryToChannels(tenantDb, product, quantity
             darazCreds,
             () =>
               DarazIntegration.setInventory(darazCreds, {
-                sellerSku: darazCp.channel_variant_id
-                  ? undefined
-                  : darazCp.channel_seller_sku || product.sku || "",
+                sellerSku: darazCp.channel_seller_sku || product.sku || "",
                 skuId: darazCp.channel_variant_id || undefined,
                 quantity: qty,
                 price: product.price != null ? product.price : undefined,

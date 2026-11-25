@@ -189,7 +189,14 @@ export async function runProductImportForTenant(tenantName) {
           );
         }
         const channelProductId = String(extId || raw.id || "");
-        const channelVariantId = firstVariant?.id ? String(firstVariant.id) : null;
+        const channelVariantId =
+          slug === "daraz"
+            ? firstVariant?.sku_id != null
+              ? String(firstVariant.sku_id)
+              : null
+            : firstVariant?.id
+              ? String(firstVariant.id)
+              : null;
         const channelSellerSku =
           slug === "daraz"
             ? String(product.seller_sku || firstVariant?.sku || product.sku || "").trim()
@@ -208,7 +215,14 @@ export async function runProductImportForTenant(tenantName) {
                 ...(slug === "daraz"
                   ? { channel_seller_sku: String(variant?.sku || "").trim() || null }
                   : {}),
-                channel_variant_id: variant?.id != null ? String(variant.id) : null,
+                channel_variant_id:
+                  slug === "daraz"
+                    ? variant?.sku_id != null
+                      ? String(variant.sku_id)
+                      : null
+                    : variant?.id != null
+                      ? String(variant.id)
+                      : null,
                 channel_inventory_item_id:
                   variant?.inventory_item_id != null ? String(variant.inventory_item_id) : null,
               }))

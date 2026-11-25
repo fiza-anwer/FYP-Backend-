@@ -170,7 +170,6 @@ export function buildPriceQuantityXml(skus) {
   const skuNodes = skus
     .map((s) => {
       const parts = [];
-      if (s.sellerSku) parts.push(`<SellerSku>${escapeXml(s.sellerSku)}</SellerSku>`);
       if (s.skuId) parts.push(`<SkuId>${escapeXml(s.skuId)}</SkuId>`);
       if (s.quantity != null) parts.push(`<Quantity>${Math.max(0, Math.floor(Number(s.quantity)))}</Quantity>`);
       if (s.price != null && !Number.isNaN(Number(s.price))) {
@@ -185,9 +184,9 @@ export function buildPriceQuantityXml(skus) {
 
 /** Update stock and/or price on Daraz for one or more SKUs. */
 export async function updateProductPriceQuantity(accessToken, skus) {
-  const list = Array.isArray(skus) ? skus.filter((s) => s.sellerSku || s.skuId) : [];
+  const list = Array.isArray(skus) ? skus.filter((s) => s.skuId) : [];
   if (list.length === 0) {
-    throw new Error("Daraz update requires SellerSku or SkuId");
+    throw new Error("Daraz update requires SkuId");
   }
   const xml = buildPriceQuantityXml(list);
   const json = await darazPost("/product/price_quantity/update", { payload: xml }, accessToken);

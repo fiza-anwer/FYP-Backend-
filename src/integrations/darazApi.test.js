@@ -1,6 +1,24 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { darazPost, signRequest } from "./darazApi.js";
+import {
+  buildPriceQuantityXml,
+  darazPost,
+  signRequest,
+  updateProductPriceQuantity,
+} from "./darazApi.js";
+
+test("price and quantity updates require SkuId and omit the unsupported SellerSku field", async () => {
+  const xml = buildPriceQuantityXml([
+    { sellerSku: "SELLER-1", skuId: "90001", quantity: 2, price: 12.5 },
+  ]);
+
+  assert.match(xml, /<SkuId>90001<\/SkuId>/);
+  assert.doesNotMatch(xml, /SellerSku/);
+  await assert.rejects(
+    updateProductPriceQuantity("test-access-token", [{ sellerSku: "SELLER-1" }]),
+    /Daraz update requires SkuId/
+  );
+});
 
 test("sends signed Daraz POST business parameters in a multipart form body", async () => {
   const originalFetch = globalThis.fetch;

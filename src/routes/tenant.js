@@ -2253,9 +2253,7 @@ router.patch("/inventory/:product_id", async (req, res) => {
               darazCreds,
               () =>
                 DarazIntegration.setInventory(darazCreds, {
-                  sellerSku: darazCp.channel_variant_id
-                    ? undefined
-                    : darazCp.channel_seller_sku || product.sku || "",
+                  sellerSku: darazCp.channel_seller_sku || product.sku || "",
                   skuId: darazCp.channel_variant_id || undefined,
                   quantity: updated.quantity,
                   price: product.price != null ? product.price : undefined,

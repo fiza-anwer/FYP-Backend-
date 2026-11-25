@@ -40,6 +40,7 @@ function mapDarazProduct(item) {
 
   const variants = skus.map((s, idx) => ({
     id: s.SkuId || s.sku_id || s.ShopSku || String(idx),
+    sku_id: String(s.SkuId || s.sku_id || "").trim(),
     sku: s.SellerSku || s.seller_sku || s.ShopSku || "",
     title: s.color || s.size || s.seller_sku || "",
     option1: s.color || s.size || undefined,
@@ -59,7 +60,10 @@ function mapDarazProduct(item) {
     price: typeof price === "number" && !Number.isNaN(price) ? price : null,
     source: "daraz",
     raw: item,
-    variants: variants.length > 0 ? variants : [{ sku: sellerSku, id: skuId, price, inventory_quantity }],
+    variants:
+      variants.length > 0
+        ? variants
+        : [{ sku: sellerSku, id: skuId, sku_id: String(skuId).trim(), price, inventory_quantity }],
   };
 }
 
@@ -282,25 +286,70 @@ export class DarazIntegration {
   }
 
   /**
-   * Push stock/price to Daraz for an existing seller SKU or SkuId.
+   * Resolve a seller SKU to Daraz's internal SkuId for price/quantity updates.
+   */
+  static async findSkuIdBySellerSku(credentials, sellerSku) {
+    const wanted = String(sellerSku || "").trim().toLowerCase();
+    if (!wanted) return "";
+
+    const products = await DarazIntegration.fetchProducts(credentials || {});
+    for (const product of products) {
+      const variant = product.variants?.find(
+        (candidate) => String(candidate.sku || "").trim().toLowerCase() === wanted
+      );
+      if (variant?.sku_id) return String(variant.sku_id).trim();
+      if (String(product.sku || "").trim().toLowerCase() === wanted && product.sku_id) {
+        return String(product.sku_id).trim();
+      }
+    }
+    return "";
+  }
+
+  /**
+   * Push stock/price to Daraz using its internal SkuId.
    * @returns {{ success: boolean, error?: string }}
    */
   static async setInventory(credentials, { sellerSku, skuId, quantity, price }) {
     try {
       const creds = credentials || {};
-      if (!sellerSku && !skuId) {
-        return { success: false, error: "Daraz SKU mapping missing (SellerSku or SkuId)" };
+      const normalizedSellerSku = String(sellerSku || "").trim();
+      let resolvedSkuId = String(skuId || "").trim();
+      if (
+        !resolvedSkuId ||
+        (normalizedSellerSku && resolvedSkuId.toLowerCase() === normalizedSellerSku.toLowerCase())
+      ) {
+        resolvedSkuId = await DarazIntegration.findSkuIdBySellerSku(creds, normalizedSellerSku);
       }
-      await DarazIntegration.withRefreshedAccess(creds, async (accessToken) => {
-        await updateProductPriceQuantity(accessToken, [
-          {
-            sellerSku: sellerSku || undefined,
-            skuId: skuId || undefined,
-            quantity,
-            price: price != null ? price : undefined,
-          },
-        ]);
-      });
+      if (!resolvedSkuId) {
+        return {
+          success: false,
+          error: normalizedSellerSku
+            ? `Could not find a Daraz SkuId for SellerSku "${normalizedSellerSku}".`
+            : "Daraz SKU mapping is missing (SkuId required).",
+        };
+      }
+
+      const update = (resolvedId) =>
+        DarazIntegration.withRefreshedAccess(creds, async (accessToken) => {
+          await updateProductPriceQuantity(accessToken, [
+            {
+              skuId: resolvedId,
+              quantity,
+              price: price != null ? price : undefined,
+            },
+          ]);
+        });
+      try {
+        await update(resolvedSkuId);
+      } catch (err) {
+        if (!normalizedSellerSku || !/E4185|E0501/i.test(String(err?.message || err))) {
+          throw err;
+        }
+        const lookedUpSkuId = await DarazIntegration.findSkuIdBySellerSku(creds, normalizedSellerSku);
+        if (!lookedUpSkuId || lookedUpSkuId === resolvedSkuId) throw err;
+        await update(lookedUpSkuId);
+        resolvedSkuId = lookedUpSkuId;
+      }
       return { success: true };
     } catch (err) {
       return { success: false, error: err.message || String(err) };
@@ -321,14 +370,19 @@ export class DarazIntegration {
    * Sync local product to Daraz: create listing if not mapped, else update stock/price.
    */
   static async pushProduct(credentials, product, channelMapping = {}) {
-    const sellerSku =
-      (channelMapping.channel_seller_sku || product.sku || product.variants?.[0]?.sku || "").trim();
-    const existingItemId = channelMapping.channel_product_id || product.external_id || "";
+    const productSku = (product.sku || product.variants?.[0]?.sku || "").trim();
+    const existingItemId =
+      channelMapping.channel_product_id ||
+      (product.source === "daraz" ? product.external_id : "") ||
+      "";
+    const sellerSku = (
+      existingItemId ? channelMapping.channel_seller_sku || productSku : productSku
+    ).trim();
 
     if (!existingItemId) {
       const created = await DarazIntegration.createProduct(credentials, {
         ...product,
-        sku: sellerSku || product.sku,
+        sku: productSku,
       });
       return {
         external_id: created.item_id || null,
@@ -339,7 +393,11 @@ export class DarazIntegration {
       };
     }
 
-    const skuId = channelMapping.channel_variant_id || product.variants?.[0]?.id || "";
+    const skuId =
+      channelMapping.channel_variant_id ||
+      product.variants?.[0]?.sku_id ||
+      product.sku_id ||
+      "";
     const qty =
       typeof product.inventory_quantity === "number"
         ? product.inventory_quantity
@@ -349,7 +407,7 @@ export class DarazIntegration {
     const price = product.price != null ? product.price : product.variants?.[0]?.price;
 
     const result = await DarazIntegration.setInventory(credentials, {
-      sellerSku: skuId ? undefined : sellerSku || undefined,
+      sellerSku: sellerSku || undefined,
       skuId: skuId || undefined,
       quantity: qty,
       price,

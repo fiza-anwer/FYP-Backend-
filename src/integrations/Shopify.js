@@ -423,7 +423,7 @@ export class ShopifyIntegration {
         mappedVariant?.channel_variant_id != null
           ? String(mappedVariant.channel_variant_id)
           : "";
-      const sku = String(mappedVariant?.channel_sku || variant?.sku || "").trim();
+      const sku = String(variant?.sku || product.sku || mappedVariant?.channel_sku || "").trim();
       const remote =
         (mappedVariantId &&
           currentVariants.find(

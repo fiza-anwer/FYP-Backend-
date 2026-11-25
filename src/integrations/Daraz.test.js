@@ -139,3 +139,176 @@ test("shares an in-flight Daraz token refresh for concurrent requests", async ()
     else process.env.DARAZ_APP_SECRET = originalAppSecret;
   }
 });
+
+test("creates a Daraz listing when a Shopify product has an external ID", async () => {
+  const originalCreateProduct = DarazIntegration.createProduct;
+  const originalSetInventory = DarazIntegration.setInventory;
+  let createdProduct;
+  let inventoryUpdated = false;
+  DarazIntegration.createProduct = async (_credentials, product) => {
+    createdProduct = product;
+    return { item_id: "daraz-item-1", sku_id: "daraz-sku-1", seller_sku: product.sku };
+  };
+  DarazIntegration.setInventory = async () => {
+    inventoryUpdated = true;
+    return { success: true };
+  };
+
+  try {
+    const result = await DarazIntegration.pushProduct(
+      {},
+      { source: "shopify", external_id: "shopify-product-1", sku: "SKU-1" }
+    );
+
+    assert.equal(createdProduct.sku, "SKU-1");
+    assert.equal(inventoryUpdated, false);
+    assert.equal(result.channel_product_id, "daraz-item-1");
+    assert.equal(result.created, true);
+  } finally {
+    DarazIntegration.createProduct = originalCreateProduct;
+    DarazIntegration.setInventory = originalSetInventory;
+  }
+});
+
+test("uses the product SKU when creating despite a stale Daraz SKU mapping", async () => {
+  const originalCreateProduct = DarazIntegration.createProduct;
+  let createdProduct;
+  DarazIntegration.createProduct = async (_credentials, product) => {
+    createdProduct = product;
+    return { item_id: "daraz-item-2", sku_id: "daraz-sku-2", seller_sku: product.sku };
+  };
+
+  try {
+    await DarazIntegration.pushProduct(
+      {},
+      { source: "shopify", sku: "LP789-EDP50ML" },
+      { channel_seller_sku: "Other" }
+    );
+
+    assert.equal(createdProduct.sku, "LP789-EDP50ML");
+  } finally {
+    DarazIntegration.createProduct = originalCreateProduct;
+  }
+});
+
+test("resolves legacy SellerSku mappings to Daraz SkuId before updating inventory", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAppKey = process.env.DARAZ_APP_KEY;
+  const originalAppSecret = process.env.DARAZ_APP_SECRET;
+  process.env.DARAZ_APP_KEY = "test-app-key";
+  process.env.DARAZ_APP_SECRET = "test-app-secret";
+  let updatePayload = "";
+
+  globalThis.fetch = async (input, options) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith("/products/get")) {
+      return jsonResponse({
+        code: "0",
+        data: {
+          products: [
+            {
+              item_id: "item-1",
+              attributes: { name: "Test product" },
+              skus: [
+                {
+                  SellerSku: "SELLER-1",
+                  SkuId: "90001",
+                  ShopSku: "SHOP-1",
+                  price: "12.5",
+                  quantity: "3",
+                },
+              ],
+            },
+          ],
+          total_products: 1,
+        },
+      });
+    }
+    if (url.pathname.endsWith("/product/price_quantity/update")) {
+      updatePayload = options.body.get("payload");
+      return jsonResponse({ code: "0", data: {} });
+    }
+    throw new Error(`Unexpected Daraz request: ${url.pathname}`);
+  };
+
+  try {
+    const result = await DarazIntegration.setInventory(
+      { access_token: "test-access-token" },
+      {
+        sellerSku: "SELLER-1",
+        skuId: "SELLER-1",
+        quantity: 2,
+        price: 10,
+      }
+    );
+
+    assert.deepEqual(result, { success: true });
+    assert.match(updatePayload, /<SkuId>90001<\/SkuId>/);
+    assert.doesNotMatch(updatePayload, /SellerSku/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalAppKey === undefined) delete process.env.DARAZ_APP_KEY;
+    else process.env.DARAZ_APP_KEY = originalAppKey;
+    if (originalAppSecret === undefined) delete process.env.DARAZ_APP_SECRET;
+    else process.env.DARAZ_APP_SECRET = originalAppSecret;
+  }
+});
+
+test("retries inventory updates with the SkuId resolved from SellerSku after a stale ID error", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAppKey = process.env.DARAZ_APP_KEY;
+  const originalAppSecret = process.env.DARAZ_APP_SECRET;
+  process.env.DARAZ_APP_KEY = "test-app-key";
+  process.env.DARAZ_APP_SECRET = "test-app-secret";
+  const updateSkuIds = [];
+
+  globalThis.fetch = async (input, options) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith("/product/price_quantity/update")) {
+      const payload = options.body.get("payload");
+      updateSkuIds.push(payload.match(/<SkuId>(.*?)<\/SkuId>/)?.[1] || "");
+      if (updateSkuIds.length === 1) {
+        return jsonResponse({
+          code: "E4185",
+          message: "Update product failed",
+        });
+      }
+      return jsonResponse({ code: "0", data: {} });
+    }
+    if (url.pathname.endsWith("/products/get")) {
+      return jsonResponse({
+        code: "0",
+        data: {
+          products: [
+            {
+              item_id: "item-1",
+              skus: [{ SellerSku: "SELLER-1", SkuId: "90001" }],
+            },
+          ],
+          total_products: 1,
+        },
+      });
+    }
+    throw new Error(`Unexpected Daraz request: ${url.pathname}`);
+  };
+
+  try {
+    const result = await DarazIntegration.setInventory(
+      { access_token: "test-access-token" },
+      {
+        sellerSku: "SELLER-1",
+        skuId: "STALE-1",
+        quantity: 2,
+      }
+    );
+
+    assert.deepEqual(result, { success: true });
+    assert.deepEqual(updateSkuIds, ["STALE-1", "90001"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalAppKey === undefined) delete process.env.DARAZ_APP_KEY;
+    else process.env.DARAZ_APP_KEY = originalAppKey;
+    if (originalAppSecret === undefined) delete process.env.DARAZ_APP_SECRET;
+    else process.env.DARAZ_APP_SECRET = originalAppSecret;
+  }
+});

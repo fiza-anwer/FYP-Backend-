@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ShopifyIntegration } from "./Shopify.js";
 
-test("updates mapped Shopify variants by saved IDs without replacing channel SKUs", async () => {
+test("updates mapped Shopify variants with their product SKUs", async () => {
   const originalFetch = globalThis.fetch;
   let updateBody;
   globalThis.fetch = async (url, options) => {
@@ -55,8 +55,8 @@ test("updates mapped Shopify variants by saved IDs without replacing channel SKU
     );
 
     assert.deepEqual(updateBody.product.variants, [
-      { id: 22, option1: "Blue Updated" },
-      { id: 11, option1: "Red Updated" },
+      { id: 22, sku: "INTERNAL-B", option1: "Blue Updated" },
+      { id: 11, sku: "INTERNAL-A", option1: "Red Updated" },
     ]);
   } finally {
     globalThis.fetch = originalFetch;

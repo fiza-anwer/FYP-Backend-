@@ -69,7 +69,7 @@ async function syncOneChannelMapping({
           credentials,
           () =>
             DarazIntegration.setInventory(credentials, {
-              sellerSku: cp.channel_variant_id ? undefined : cp.channel_seller_sku || product.sku || "",
+              sellerSku: cp.channel_seller_sku || product.sku || "",
               skuId: cp.channel_variant_id || undefined,
               quantity,
               price: product.price != null ? product.price : undefined,
