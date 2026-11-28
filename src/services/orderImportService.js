@@ -12,6 +12,22 @@ const INTEGRATION_CLASSES = {
   daraz: DarazIntegration,
 };
 
+const COUNTRY_NAME_TO_ISO = {
+  pakistan: "PK",
+  "united states": "US",
+  "united kingdom": "GB",
+  "united arab emirates": "AE",
+  india: "IN",
+};
+
+/** Accepts "PK" or "Pakistan"; unknown names keep the old behaviour (first 2 letters). */
+function toCountryCode(value) {
+  const v = String(value || "").trim();
+  if (!v) return "";
+  if (v.length === 2) return v.toUpperCase();
+  return COUNTRY_NAME_TO_ISO[v.toLowerCase()] || v.substring(0, 2).toUpperCase();
+}
+
 /**
  * Run order import for a single tenant: find active company_integrations, fetch orders, save to orders collection.
  */
@@ -69,17 +85,22 @@ export async function runOrderImportForTenant(tenantName) {
         const createdAt = parsedCreatedAt && !Number.isNaN(parsedCreatedAt.getTime())
           ? parsedCreatedAt
           : existing?.created_at || new Date();
-        const ship = raw.shipping_address || raw.shippingAddress || {};
-        const shipping_address = {
-          address1: ship.address1 || ship.address_1 || "",
-          city: ship.city || "",
-          postal_code: ship.zip || ship.postal_code || ship.postal_code_zip || "",
-          country_code: (ship.country_code || ship.country || "").toString().substring(0, 2).toUpperCase(),
-          name: ship.name || [ship.first_name, ship.last_name].filter(Boolean).join(" ") || "",
-          first_name: ship.first_name || "",
-          last_name: ship.last_name || "",
-          phone: ship.phone || "",
-        };
+        const ship =
+  raw.shipping_address ||
+  raw.shippingAddress ||
+  raw.address_shipping || // Daraz
+  raw.address_billing || // Daraz fallback
+  {};
+const shipping_address = {
+  address1: ship.address1 || ship.address_1 || "",
+  city: ship.city || "",
+  postal_code: ship.zip || ship.postal_code || ship.postal_code_zip || ship.post_code || "",
+  country_code: toCountryCode(ship.country_code || ship.country),
+  name: ship.name || [ship.first_name, ship.last_name].filter(Boolean).join(" ") || "",
+  first_name: ship.first_name || "",
+  last_name: ship.last_name || "",
+  phone: ship.phone || "",
+};
         const lineItems = [];
         const rawLines = raw.line_items || [];
         for (const li of rawLines) {
