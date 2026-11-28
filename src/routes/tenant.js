@@ -885,6 +885,164 @@ router.get("/orders", async (req, res) => {
 // ---------- Products ----------
 
 const PRODUCT_STATUSES = ["active", "draft", "archived"];
+
+async function getDarazProductMetadataContext(tenantDb, companyId) {
+  const companyOid = toObjectId(companyId);
+  if (!companyOid) return { error: "A valid company_id is required.", status: 400 };
+
+  const company = await tenantDb.collection("companies").findOne({ _id: companyOid });
+  if (!company) return { error: "Company not found.", status: 404 };
+
+  const authDb = await getAuthDb();
+  const darazIntegration = await authDb.collection("integrations").findOne({ slug: "daraz" });
+  if (!darazIntegration) {
+    return { error: "Daraz integration is not configured on this server.", status: 503 };
+  }
+
+  const companyIntegrations = tenantDb.collection("company_integrations");
+  const companyIntegration = await companyIntegrations.findOne({
+    company_id: { $in: [companyOid, companyOid.toString()] },
+    integration_id: { $in: [darazIntegration._id, darazIntegration._id.toString()] },
+    status: 1,
+    $or: [
+      { features: { $exists: false } },
+      { features: "products" },
+      { features: { $in: ["products"] } },
+    ],
+  });
+  if (!companyIntegration?.credentials) {
+    return {
+      error: "Connect Daraz for this company and enable the Products feature to load categories.",
+      status: 400,
+    };
+  }
+
+  return { companyIntegrations, companyIntegration };
+}
+
+function publicDarazCategoryAttributes(attributes) {
+  return attributes
+    .filter((attribute) => attribute?.name)
+    .map((attribute) => ({
+      name: String(attribute.name),
+      label: String(
+        attribute.label ||
+          attribute.en_name ||
+          attribute.name_en ||
+          attribute.name ||
+          ""
+      ),
+      en_name: attribute.en_name != null ? String(attribute.en_name) : undefined,
+      id: attribute.id != null ? String(attribute.id) : undefined,
+      input_type: attribute.input_type != null ? String(attribute.input_type) : undefined,
+      attribute_type:
+        attribute.attribute_type != null ? String(attribute.attribute_type) : undefined,
+      is_mandatory: attribute.is_mandatory,
+      is_sale_prop: attribute.is_sale_prop,
+      options: Array.isArray(attribute.options)
+        ? (() => {
+            const seenValues = new Set();
+            return attribute.options
+              .map((option) => {
+                const name = String(option?.name || option?.en_name || option?.value || "").trim();
+                if (!name) return null;
+                const normalizedOption = {
+                  name,
+                  label: String(option?.en_name || option?.name || option?.value || name).trim(),
+                  value: String(option?.value ?? option?.name ?? option?.en_name ?? name).trim(),
+                };
+                if (seenValues.has(normalizedOption.value)) return null;
+                seenValues.add(normalizedOption.value);
+                return normalizedOption;
+              })
+              .filter(Boolean);
+          })()
+        : [],
+    }));
+}
+
+function normalizeDarazCategoryId(value) {
+  if (value == null || String(value).trim() === "") return null;
+  const categoryId = String(value).trim();
+  if (!/^\d{1,20}$/.test(categoryId)) {
+    throw new Error("Daraz category ID must be a numeric category from the connected account.");
+  }
+  return categoryId;
+}
+
+function normalizeDarazAttributes(value) {
+  if (value == null) return {};
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Daraz attributes must be an object.");
+  }
+  const attributes = {};
+  for (const [name, rawValue] of Object.entries(value)) {
+    if (!/^[A-Za-z0-9_-]{1,80}$/.test(name)) {
+      throw new Error("Daraz attribute name is invalid.");
+    }
+    if (typeof rawValue !== "string" && typeof rawValue !== "number") {
+      throw new Error(`Daraz attribute "${name}" must be text.`);
+    }
+    const text = String(rawValue).trim();
+    if (text.length > 5000) {
+      throw new Error(`Daraz attribute "${name}" is too long.`);
+    }
+    if (text) attributes[name] = text;
+  }
+  return attributes;
+}
+
+router.get("/products/daraz/categories", async (req, res) => {
+  try {
+    if (!(await tenantDbExists(req.tenantName))) {
+      return res.status(400).json({ error: "Tenant has no data." });
+    }
+    const tenantDb = await getTenantDb(req.tenantName);
+    const context = await getDarazProductMetadataContext(tenantDb, req.query.company_id);
+    if (context.error) return res.status(context.status).json({ error: context.error });
+
+    const storedCredentials = decryptStoredCredentials(context.companyIntegration.credentials);
+    const credentials = await DarazIntegration.ensureAccessToken(storedCredentials);
+    const categories = await withPersistedDarazCredentials(
+      context.companyIntegrations,
+      context.companyIntegration,
+      credentials,
+      () => DarazIntegration.getCategories(credentials)
+    );
+    return res.json({ categories });
+  } catch (err) {
+    console.error("[Daraz] Product categories failed:", err.message);
+    return res.status(502).json({ error: err.message || "Failed to load Daraz categories." });
+  }
+});
+
+router.get("/products/daraz/categories/:categoryId/attributes", async (req, res) => {
+  try {
+    if (!(await tenantDbExists(req.tenantName))) {
+      return res.status(400).json({ error: "Tenant has no data." });
+    }
+    const tenantDb = await getTenantDb(req.tenantName);
+    const context = await getDarazProductMetadataContext(tenantDb, req.query.company_id);
+    if (context.error) return res.status(context.status).json({ error: context.error });
+
+    const storedCredentials = decryptStoredCredentials(context.companyIntegration.credentials);
+    const credentials = await DarazIntegration.ensureAccessToken(storedCredentials);
+    const attributes = await withPersistedDarazCredentials(
+      context.companyIntegrations,
+      context.companyIntegration,
+      credentials,
+      () => DarazIntegration.getCategoryAttributes(credentials, req.params.categoryId)
+    );
+    return res.json({ attributes: publicDarazCategoryAttributes(attributes) });
+  } catch (err) {
+    console.error("[Daraz] Product category attributes failed:", err.message);
+    const status = /category ID/i.test(err.message || "") ? 400 : 502;
+    return res.status(status).json({
+      error: err.message || "Failed to load Daraz category attributes.",
+    });
+  }
+});
+
 function parseProductPrice(val) {
   if (val === undefined || val === null || val === "") return null;
   const n = Number(val);
@@ -1140,6 +1298,8 @@ router.get("/products", async (req, res) => {
         title: p.title || "",
         sku: p.sku || "",
         product_type: p.product_type || "",
+        daraz_category_id: p.daraz_category_id || null,
+        daraz_attributes: p.daraz_attributes || {},
         status: normalizeProductStatus(p.status),
         price: p.price,
         price_old: p.price_old,
@@ -1368,7 +1528,17 @@ router.post("/products", async (req, res) => {
       integration_slugs: integrationSlugsBody,
       variants: variantsBody,
       quantity: quantityBody,
+      daraz_category_id: darazCategoryIdBody,
+      daraz_attributes: darazAttributesBody,
     } = req.body || {};
+    let darazCategoryId;
+    let darazAttributes;
+    try {
+      darazCategoryId = normalizeDarazCategoryId(darazCategoryIdBody);
+      darazAttributes = normalizeDarazAttributes(darazAttributesBody);
+    } catch (validationError) {
+      return res.status(400).json({ error: validationError.message });
+    }
     if (!title || typeof title !== "string" || !String(title).trim()) {
       return res.status(400).json({ error: "Title is required and cannot be empty." });
     }
@@ -1501,6 +1671,8 @@ router.post("/products", async (req, res) => {
       title: titleTrimmed,
       sku: effectiveSku,
       product_type: productTypeTrimmed,
+      daraz_category_id: darazCategoryId,
+      daraz_attributes: darazAttributes,
       status: normalizeProductStatus(status),
       price: parseProductPrice(price),
       price_old: parseProductPrice(price_old),
@@ -1646,6 +1818,8 @@ router.post("/products", async (req, res) => {
       title: created.title,
       sku: created.sku,
       product_type: created.product_type,
+      daraz_category_id: created.daraz_category_id,
+      daraz_attributes: created.daraz_attributes,
       status: responseStatus,
       price: created.price,
       price_old: created.price_old,
@@ -1703,6 +1877,8 @@ router.put("/products/:id", async (req, res) => {
       vendor,
       integration_slugs: integrationSlugsBody,
       variants: variantsBody,
+      daraz_category_id: darazCategoryIdBody,
+      daraz_attributes: darazAttributesBody,
     } = req.body || {};
     const tenantDb = await getTenantDb(tenantName);
     const companiesColl = tenantDb.collection("companies");
@@ -1714,6 +1890,20 @@ router.put("/products/:id", async (req, res) => {
     }
     if (sku !== undefined) update.sku = normalizeSku(sku);
     if (product_type !== undefined) update.product_type = formatTitleCase(product_type);
+    if (darazCategoryIdBody !== undefined) {
+      try {
+        update.daraz_category_id = normalizeDarazCategoryId(darazCategoryIdBody);
+      } catch (validationError) {
+        return res.status(400).json({ error: validationError.message });
+      }
+    }
+    if (darazAttributesBody !== undefined) {
+      try {
+        update.daraz_attributes = normalizeDarazAttributes(darazAttributesBody);
+      } catch (validationError) {
+        return res.status(400).json({ error: validationError.message });
+      }
+    }
     if (status !== undefined) update.status = normalizeProductStatus(status);
     if (price !== undefined) update.price = parseProductPrice(price);
     if (price_old !== undefined) update.price_old = parseProductPrice(price_old);
@@ -1775,6 +1965,9 @@ router.put("/products/:id", async (req, res) => {
       p.product_type !== previousProduct.product_type ||
       p.sku !== previousProduct.sku ||
       JSON.stringify(p.variants) !== JSON.stringify(previousProduct.variants);
+    const darazListingDetailsChanged =
+      p.daraz_category_id !== previousProduct.daraz_category_id ||
+      JSON.stringify(p.daraz_attributes) !== JSON.stringify(previousProduct.daraz_attributes);
     let company_name = null;
     if (p.company_id) {
       const company = await companiesColl.findOne({ _id: p.company_id });
@@ -1822,9 +2015,9 @@ router.put("/products/:id", async (req, res) => {
       if (!darazWasSynced) {
         const darazRes = await pushProductToDarazForCompany(tenantDb, p, oid, { integrationSlugs });
         if (darazRes.warning) daraz_sync_warning = darazRes.warning;
-      } else if (productTextChanged) {
+      } else if (productTextChanged || darazListingDetailsChanged) {
         daraz_sync_warning =
-          "Product text was saved in UniSell, but the current Daraz integration cannot update listing names, categories, variant labels, or seller SKUs. Update the listing in Daraz Seller Center.";
+          "Product details were saved in UniSell, but this Daraz integration cannot update an existing listing's category attributes. Update the listing in Daraz Seller Center.";
       }
     }
 
@@ -1847,6 +2040,8 @@ router.put("/products/:id", async (req, res) => {
       shopify_synced: isChannelProductSynced(cpShopify),
       daraz_synced: isChannelProductSynced(cpDaraz),
       variants: pAfter.variants || [],
+      daraz_category_id: pAfter.daraz_category_id || null,
+      daraz_attributes: pAfter.daraz_attributes || {},
       variant_count:
         typeof pAfter.variant_count === "number"
           ? pAfter.variant_count

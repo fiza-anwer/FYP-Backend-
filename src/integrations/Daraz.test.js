@@ -191,6 +191,70 @@ test("uses the product SKU when creating despite a stale Daraz SKU mapping", asy
   }
 });
 
+test("loads Daraz categories and category-specific attributes for the product form", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAppKey = process.env.DARAZ_APP_KEY;
+  const originalAppSecret = process.env.DARAZ_APP_SECRET;
+  const requestedPaths = [];
+  process.env.DARAZ_APP_KEY = "test-app-key";
+  process.env.DARAZ_APP_SECRET = "test-app-secret";
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    requestedPaths.push(url.pathname);
+    if (url.pathname.endsWith("/category/tree/get")) {
+      return jsonResponse({
+        code: "0",
+        data: [
+          {
+            name: "Electronics",
+            children: [{ name: "Audio", category_id: "123", leaf: true }],
+          },
+        ],
+      });
+    }
+    if (url.pathname.endsWith("/category/attributes/get")) {
+      return jsonResponse({
+        code: "0",
+        data: [
+          {
+            name: "brand",
+            label: "Brand",
+            is_mandatory: 1,
+            options: [{ name: "Samsung", value: "BRAND-123" }],
+          },
+        ],
+      });
+    }
+    throw new Error(`Unexpected Daraz request: ${url.pathname}`);
+  };
+
+  try {
+    const credentials = { access_token: "test-access-token" };
+    const categories = await DarazIntegration.getCategories(credentials);
+    const attributes = await DarazIntegration.getCategoryAttributes(credentials, "123");
+
+    assert.deepEqual(categories, [{ id: "123", path: "Electronics > Audio" }]);
+    assert.deepEqual(attributes, [
+      {
+        name: "brand",
+        label: "Brand",
+        is_mandatory: 1,
+        options: [{ name: "Samsung", value: "BRAND-123" }],
+      },
+    ]);
+    assert.deepEqual(
+      requestedPaths.map((path) => path.slice(path.lastIndexOf("/category/"))),
+      ["/category/tree/get", "/category/attributes/get"]
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalAppKey === undefined) delete process.env.DARAZ_APP_KEY;
+    else process.env.DARAZ_APP_KEY = originalAppKey;
+    if (originalAppSecret === undefined) delete process.env.DARAZ_APP_SECRET;
+    else process.env.DARAZ_APP_SECRET = originalAppSecret;
+  }
+});
+
 test("resolves legacy SellerSku mappings to Daraz SkuId before updating inventory", async () => {
   const originalFetch = globalThis.fetch;
   const originalAppKey = process.env.DARAZ_APP_KEY;

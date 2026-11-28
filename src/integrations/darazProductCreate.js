@@ -9,7 +9,12 @@ function escapeXml(s) {
 }
 
 function isMandatory(attr) {
-  return attr?.is_mandatory === 1 || attr?.is_mandatory === true || attr?.is_mandatory === "1";
+  return (
+    attr?.is_mandatory === 1 ||
+    attr?.is_mandatory === true ||
+    attr?.is_mandatory === "1" ||
+    String(attr?.is_mandatory || "").toLowerCase() === "true"
+  );
 }
 
 function isSizeChartAttribute(attr) {
@@ -55,6 +60,10 @@ async function getCategoryLeaves(accessToken) {
   const leaves = walkCategoryTree(json.data);
   categoryTreeCache = { at: now, leaves };
   return leaves;
+}
+
+export async function fetchDarazCategories(accessToken) {
+  return getCategoryLeaves(accessToken);
 }
 
 /**
@@ -118,6 +127,10 @@ function optionLabel(opt) {
   return String(opt?.name || opt?.en_name || opt?.value || "").trim();
 }
 
+function optionValue(opt) {
+  return String(opt?.value ?? opt?.name ?? opt?.en_name ?? "").trim();
+}
+
 /** For dropdown/enum attributes, value MUST be one of attr.options (Daraz CHK_CATPROP_CPV_NOT_ENUM). */
 function pickEnumOption(attr, preferredTexts = []) {
   const options = Array.isArray(attr.options) ? attr.options : [];
@@ -129,7 +142,7 @@ function pickEnumOption(attr, preferredTexts = []) {
 
   for (const pref of prefs) {
     const exact = options.find((o) => optionLabel(o).toLowerCase() === pref);
-    if (exact) return optionLabel(exact);
+    if (exact) return optionValue(exact);
   }
   for (const pref of prefs) {
     if (pref === "no brand") continue;
@@ -137,22 +150,39 @@ function pickEnumOption(attr, preferredTexts = []) {
       const label = optionLabel(o).toLowerCase();
       return label.includes(pref) || pref.includes(label);
     });
-    if (partial) return optionLabel(partial);
+    if (partial) return optionValue(partial);
   }
 
   const noBrand = options.find((o) => /no\s*brand/i.test(optionLabel(o)));
-  if (noBrand) return optionLabel(noBrand);
+  if (noBrand) return optionValue(noBrand);
 
   const other = options.find((o) => /^other$/i.test(optionLabel(o)));
-  if (other) return optionLabel(other);
+  if (other) return optionValue(other);
 
-  return optionLabel(options[0]) || null;
+  return optionValue(options[0]) || null;
 }
 
 function pickAttributeValue(attr, product) {
   const tag = String(attr.name || "").trim();
   if (isOuterIdAttribute(attr)) {
     return String(product.sku || product.variants?.[0]?.sku || "").trim();
+  }
+  const suppliedValue = product.daraz_attributes?.[tag];
+  if (suppliedValue != null && String(suppliedValue).trim()) {
+    if (Array.isArray(attr.options) && attr.options.length > 0) {
+      const requested = String(suppliedValue).trim().toLowerCase();
+      const option = attr.options.find((candidate) =>
+        [optionValue(candidate), optionLabel(candidate), candidate?.id]
+          .some((value) => String(value ?? "").trim().toLowerCase() === requested)
+      );
+      if (!option) {
+        throw new Error(
+          `Daraz field "${tag}" must use one of the options returned for the selected category.`
+        );
+      }
+      return optionValue(option);
+    }
+    return String(suppliedValue).trim();
   }
   const title = String(product.title || "").trim() || "Product";
   const desc =
@@ -277,7 +307,7 @@ export function buildDarazCreateProductXml(product, categoryId, attributes) {
   for (const a of attributes) {
     if (!a?.name) continue;
     if (isSizeChartAttribute(a)) continue;
-    if (!isMandatory(a) && a.name !== "description") {
+    if (!isMandatory(a) && a.name !== "description" && !isOuterIdAttribute(a)) {
       continue;
     }
     if (a.attribute_type === "sku" || a.is_sale_prop === 1 || a.is_sale_prop === true) {
@@ -331,7 +361,9 @@ export function buildDarazCreateProductXml(product, categoryId, attributes) {
  * @returns {{ item_id: string, sku_id?: string, seller_sku: string }}
  */
 export async function createDarazProduct(accessToken, product) {
-  const categoryId = await resolveDarazCategoryId(accessToken, product.product_type);
+  const categoryId =
+    String(product.daraz_category_id || "").trim() ||
+    (await resolveDarazCategoryId(accessToken, product.product_type));
   if (!categoryId) {
     throw new Error(
       "Could not resolve Daraz category. Set DARAZ_DEFAULT_CATEGORY_ID in .env or set product type."

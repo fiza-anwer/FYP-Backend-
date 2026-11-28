@@ -8,7 +8,11 @@ import {
   fetchOrderItems,
   updateProductPriceQuantity,
 } from "./darazApi.js";
-import { createDarazProduct } from "./darazProductCreate.js";
+import {
+  createDarazProduct,
+  fetchDarazCategories,
+  fetchCategoryAttributes,
+} from "./darazProductCreate.js";
 import { decryptStoredCredentials } from "../db/credentialEncryption.js";
 
 const refreshResults = new Map();
@@ -165,6 +169,24 @@ export class DarazIntegration {
     if (creds.access_token) return creds;
     throw new Error(
       "Daraz is not fully connected. Open Company Integrations, select Daraz, and connect again."
+    );
+  }
+
+  static async getCategories(credentials) {
+    const creds = credentials || {};
+    return DarazIntegration.withRefreshedAccess(creds, (accessToken) =>
+      fetchDarazCategories(accessToken)
+    );
+  }
+
+  static async getCategoryAttributes(credentials, categoryId) {
+    const normalizedCategoryId = String(categoryId || "").trim();
+    if (!/^\d+$/.test(normalizedCategoryId)) {
+      throw new Error("A valid Daraz category ID is required.");
+    }
+    const creds = credentials || {};
+    return DarazIntegration.withRefreshedAccess(creds, (accessToken) =>
+      fetchCategoryAttributes(accessToken, normalizedCategoryId)
     );
   }
 
