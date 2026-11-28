@@ -9,6 +9,20 @@ const CARRIER_CLASSES = {
   leopard: LeopardIntegration,
 };
 
+export function resolveRecipientEmail(order) {
+  const raw = order?.raw || {};
+  const shipping = order?.shipping_address || raw.shipping_address || raw.shippingAddress || {};
+  const email =
+    [
+      order?.email,
+      shipping.email,
+      raw.customer_email,
+      raw.customer?.email,
+      raw.buyer?.email,
+    ].find((candidate) => typeof candidate === "string" && candidate.trim())?.trim() || "";
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && !/[*…]/.test(email) ? email : "";
+}
+
 /** Returns true if order has at least one of address1, city, postal_code, country_code. */
 function hasValidShippingAddress(order) {
   const ship = order?.shipping_address || order?.raw?.shipping_address || order?.raw?.shippingAddress || {};
@@ -27,7 +41,12 @@ function hasValidShippingAddress(order) {
  * @param {string} carrierServiceId - auth carrier_service _id
  * @returns {{ created: number, errors: Array<{ order_id: string, error: string }> }}
  */
-export async function createConsignments(tenantName, orderIds, carrierIntegrationId, carrierServiceId) {
+export async function createConsignments(
+  tenantName,
+  orderIds,
+  carrierIntegrationId,
+  carrierServiceId
+) {
   const tenantDb = await getTenantDb(tenantName);
   const authDb = await getAuthDb();
   const ordersColl = tenantDb.collection("orders");
@@ -76,12 +95,47 @@ export async function createConsignments(tenantName, orderIds, carrierIntegratio
       errors.push({ order_id: orderIdStr, error: "Order has no shipping address; add a destination before creating a label" });
       continue;
     }
+    const recipientEmail = resolveRecipientEmail(order);
+    const raw = order.raw || {};
+    const shipping =
+      order.shipping_address ||
+      raw.shipping_address ||
+      raw.shippingAddress ||
+      raw.address_shipping ||
+      raw.addressShipping ||
+      {};
+    const rawShipping =
+      raw.shipping_address ||
+      raw.shippingAddress ||
+      raw.address_shipping ||
+      raw.addressShipping ||
+      shipping;
+    const orderForCarrier = {
+      ...order,
+      email: recipientEmail,
+      shipping_address: { ...shipping, email: recipientEmail },
+      raw: {
+        ...raw,
+        shipping_address: { ...rawShipping, email: recipientEmail },
+      },
+    };
+    if (recipientEmail && order.email !== recipientEmail) {
+      await ordersColl.updateOne(
+        { _id: orderId },
+        { $set: { email: recipientEmail, updated_at: new Date() } }
+      );
+    }
     let company = null;
     if (order.company_id) {
       company = await tenantDb.collection("companies").findOne({ _id: order.company_id });
     }
     try {
-      const result = await Klass.createShipment(ci.credentials || {}, order, service.code || "", company);
+      const result = await Klass.createShipment(
+        ci.credentials || {},
+        orderForCarrier,
+        service.code || "",
+        company
+      );
       const doc = {
         order_id: orderId,
         carrier_integration_id: carrierIntegrationId,

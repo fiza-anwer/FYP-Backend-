@@ -35,9 +35,11 @@ import {
   markStockAlertsRead,
 } from "../services/stockAlertService.js";
 import { getDashboardAnalytics } from "../services/dashboardAnalyticsService.js";
+import { uploadProductImage } from "../services/cloudinaryImageService.js";
 import {
   generateProductListingFromKeywords,
   getGeminiAiConfig,
+  suggestEnglishProductName,
 } from "../services/geminiProductService.js";
 import {
   formatSentenceCase,
@@ -46,6 +48,10 @@ import {
   normalizeSku,
 } from "../utils/productTextFormatting.js";
 import { withShopifyChannelSkus } from "../utils/channelSkus.js";
+import {
+  normalizeProductIntegrationScope,
+  shouldSyncProductToPlatform,
+} from "../utils/productIntegrationScope.js";
 
 // async function normalizeDarazCredentials(credentials) {
 //   const creds = { ...(credentials || {}) };
@@ -1315,6 +1321,8 @@ router.get("/products", async (req, res) => {
         images: Array.isArray(p.images) ? p.images : undefined,
         tags: Array.isArray(p.tags) ? p.tags : undefined,
         vendor: p.vendor || undefined,
+        integration_scope:
+          p.integration_scope || normalizeProductIntegrationScope(undefined, p.integration_slugs),
         integration_slugs: Array.isArray(p.integration_slugs) ? p.integration_slugs : [],
         variants: Array.isArray(p.variants) ? p.variants : [],
         variant_count: typeof p.variant_count === "number" ? p.variant_count : Array.isArray(p.variants) ? p.variants.length : 0,
@@ -1499,6 +1507,33 @@ router.post("/products/ai-generate", async (req, res) => {
   }
 });
 
+router.post("/products/suggest-english-title", async (req, res) => {
+  const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
+  if (!title) return res.status(400).json({ error: "Product title is required." });
+  if (title.length > 200) {
+    return res.status(400).json({ error: "Product title must be 200 characters or less." });
+  }
+
+  try {
+    return res.json(await suggestEnglishProductName(title));
+  } catch (err) {
+    console.error("[Gemini] product title suggestion:", err.message);
+    const message = err.message || "Could not suggest an English product title.";
+    return res.status(message.includes("not configured") ? 503 : 502).json({ error: message });
+  }
+});
+
+router.post("/products/images/upload", async (req, res) => {
+  try {
+    const imageUrl = await uploadProductImage(req.body?.image);
+    return res.json({ url: imageUrl });
+  } catch (err) {
+    const status = err.status || 502;
+    if (status >= 500) console.error("[Products] Image upload:", err.message);
+    return res.status(status).json({ error: err.message || "Product image upload failed." });
+  }
+});
+
 /** Create product (local product managed in UniSell) */
 router.post("/products", async (req, res) => {
   try {
@@ -1525,6 +1560,7 @@ router.post("/products", async (req, res) => {
       images,
       tags,
       vendor,
+      integration_scope: integrationScopeBody,
       integration_slugs: integrationSlugsBody,
       variants: variantsBody,
       quantity: quantityBody,
@@ -1621,10 +1657,12 @@ router.post("/products", async (req, res) => {
     const effectiveSku = skuTrimmed || String(variants[0]?.sku || "").trim();
 
     const integrationSlugs = Array.isArray(integrationSlugsBody)
-      ? integrationSlugsBody.filter((s) => s && String(s).trim()).map((s) => String(s).trim())
+      ? [...new Set(integrationSlugsBody.filter((s) => s && String(s).trim()).map((s) => String(s).trim()))]
       : [];
-    const pushToShopify = integrationSlugs.length === 0 || integrationSlugs.includes("shopify");
-    const pushToDaraz = integrationSlugs.length === 0 || integrationSlugs.includes("daraz");
+    const integrationScope = normalizeProductIntegrationScope(integrationScopeBody, integrationSlugs);
+    const selectedPlatforms = { integration_scope: integrationScope, integration_slugs: integrationSlugs };
+    const pushToShopify = shouldSyncProductToPlatform(selectedPlatforms, "shopify");
+    const pushToDaraz = shouldSyncProductToPlatform(selectedPlatforms, "daraz");
 
     const authDb = await getAuthDb();
     const integrationsColl = authDb.collection("integrations");
@@ -1687,6 +1725,7 @@ router.post("/products", async (req, res) => {
       images: Array.isArray(images) ? images : undefined,
       tags: Array.isArray(tags) ? tags : undefined,
       vendor: vendor != null ? String(vendor).trim() : undefined,
+      integration_scope: integrationScope,
       integration_slugs: integrationSlugs,
       variants,
       variant_count: variants.length,
@@ -1824,6 +1863,7 @@ router.post("/products", async (req, res) => {
       price: created.price,
       price_old: created.price_old,
       source: productSource,
+      integration_scope: created.integration_scope,
       integration_slugs: created.integration_slugs || [],
       shopify_synced: shopifySynced,
       daraz_synced: darazSynced,
@@ -1875,6 +1915,7 @@ router.put("/products/:id", async (req, res) => {
       images,
       tags,
       vendor,
+      integration_scope: integrationScopeBody,
       integration_slugs: integrationSlugsBody,
       variants: variantsBody,
       daraz_category_id: darazCategoryIdBody,
@@ -1919,7 +1960,17 @@ router.put("/products/:id", async (req, res) => {
     if (images !== undefined) update.images = Array.isArray(images) ? images : undefined;
     if (tags !== undefined) update.tags = Array.isArray(tags) ? tags : undefined;
     if (vendor !== undefined) update.vendor = vendor == null ? undefined : String(vendor).trim();
-    if (integrationSlugsBody !== undefined) update.integration_slugs = Array.isArray(integrationSlugsBody) ? integrationSlugsBody.filter((s) => s && String(s).trim()) : [];
+    if (integrationSlugsBody !== undefined) {
+      update.integration_slugs = Array.isArray(integrationSlugsBody)
+        ? [...new Set(integrationSlugsBody.filter((s) => s && String(s).trim()).map((s) => String(s).trim()))]
+        : [];
+    }
+    if (integrationScopeBody !== undefined || integrationSlugsBody !== undefined) {
+      update.integration_scope = normalizeProductIntegrationScope(
+        integrationScopeBody,
+        update.integration_slugs || []
+      );
+    }
     if (companyIdBody !== undefined) {
       if (!companyIdBody || !String(companyIdBody).trim()) {
         update.company_id = null;
@@ -1978,10 +2029,9 @@ router.put("/products/:id", async (req, res) => {
     let shopify_sync_warning = null;
     let category_warning = null;
     const integrationSlugs = Array.isArray(p.integration_slugs) ? p.integration_slugs : [];
-    const pushToDaraz =
-      integrationSlugs.length === 0 || integrationSlugs.includes("daraz");
-    const pushToShopify =
-      integrationSlugs.length === 0 || integrationSlugs.includes("shopify");
+    const integrationScope = normalizeProductIntegrationScope(p.integration_scope, integrationSlugs);
+    const pushToDaraz = shouldSyncProductToPlatform(p, "daraz");
+    const pushToShopify = shouldSyncProductToPlatform(p, "shopify");
 
     const productIdValues = [oid, oid.toString()];
     const darazCpBefore = await cpColl.findOne({
@@ -2036,6 +2086,7 @@ router.put("/products/:id", async (req, res) => {
       price: pAfter.price,
       price_old: pAfter.price_old,
       source: pAfter.source,
+      integration_scope: integrationScope,
       integration_slugs: integrationSlugs,
       shopify_synced: isChannelProductSynced(cpShopify),
       daraz_synced: isChannelProductSynced(cpDaraz),
@@ -2079,6 +2130,9 @@ router.post("/products/:id/push-to-shopify", async (req, res) => {
     const productsColl = tenantDb.collection("products");
     const p = await productsColl.findOne({ _id: oid });
     if (!p) return res.status(404).json({ error: "Product not found" });
+    if (!shouldSyncProductToPlatform(p, "shopify")) {
+      return res.status(400).json({ error: "Shopify is not selected for this product." });
+    }
     if (!p.company_id) {
       return res.status(400).json({ error: "Product has no company. Set a company on the product, then push to Shopify." });
     }
@@ -2183,6 +2237,9 @@ router.post("/products/:id/push-to-daraz", async (req, res) => {
     const tenantDb = await getTenantDb(tenantName);
     const p = await tenantDb.collection("products").findOne({ _id: oid });
     if (!p) return res.status(404).json({ error: "Product not found" });
+    if (!shouldSyncProductToPlatform(p, "daraz")) {
+      return res.status(400).json({ error: "Daraz is not selected for this product." });
+    }
     const productTypeTrimmed = p.product_type != null ? String(p.product_type).trim() : "";
     if (!productTypeTrimmed) {
       return res.status(400).json({
@@ -2631,7 +2688,12 @@ router.post("/consignments", async (req, res) => {
     if (!carrier_integration_id || !carrier_service_id) {
       return res.status(400).json({ error: "carrier_integration_id and carrier_service_id are required" });
     }
-    const result = await createConsignments(tenantName, order_ids, carrier_integration_id, carrier_service_id);
+    const result = await createConsignments(
+      tenantName,
+      order_ids,
+      carrier_integration_id,
+      carrier_service_id
+    );
     return res.json({ created: result.created, errors: result.errors });
   } catch (err) {
     console.error(err);

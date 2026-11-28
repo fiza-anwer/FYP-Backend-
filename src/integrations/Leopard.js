@@ -86,12 +86,12 @@ function buildShipment(company) {
   };
 }
 
-function buildConsignment(shipping) {
+function buildConsignment(shipping, orderEmail) {
   const name =
     [shipping.first_name, shipping.last_name].filter(Boolean).join(" ") ||
     shipping.name ||
     "Recipient";
-  const email = shipping.email || "recipient@example.com";
+  const email = shipping.email || orderEmail || "recipient@example.com";
   const phone = shipping.phone || "0000000000";
   const address =
     shipping.address1 ||
@@ -214,7 +214,7 @@ export class LeopardIntegration {
 
     const shipping = getShippingFromOrder(order);
     const shipment = buildShipment(company || {});
-    const consignment = buildConsignment(shipping);
+    const consignment = buildConsignment(shipping, order?.email);
 
     const collectAmount =
       order?.cod_amount ?? order?.raw?.cod_amount ?? order?.total_price ?? "0";

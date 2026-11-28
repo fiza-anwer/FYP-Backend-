@@ -206,7 +206,7 @@ function normalizeListing(parsed) {
   };
 }
 
-async function callGeminiGenerate(apiKey, model, prompt) {
+async function callGeminiGenerate(apiKey, model, prompt, temperature = 0.65) {
   const url = `${API_ROOT}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
   const res = await fetch(url, {
     method: "POST",
@@ -214,7 +214,7 @@ async function callGeminiGenerate(apiKey, model, prompt) {
     body: JSON.stringify({
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: {
-        temperature: 0.65,
+        temperature,
         responseMimeType: "application/json",
       },
     }),
@@ -287,6 +287,64 @@ Rules:
   if (quotaFailures > 0) {
     throw new Error(
       "Gemini free tier quota is used up for all models we tried. Wait a few minutes, pick gemini-2.5-flash in the model dropdown, or add billing in Google AI Studio: https://ai.google.dev/gemini-api/docs/rate-limits"
+    );
+  }
+  throw new Error(lastError);
+}
+
+export function normalizeEnglishProductName(parsed) {
+  const title = String(parsed?.title || "").replace(/\s+/g, " ").trim().slice(0, 120);
+  if (!title) throw new Error("Gemini did not return an English product name.");
+  if (/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/u.test(title)) {
+    throw new Error("Gemini's suggestion was not in English. Please try again.");
+  }
+  return title;
+}
+
+export async function suggestEnglishProductName(productName) {
+  const apiKey = getApiKey();
+  const sourceName = String(productName || "").trim();
+  const listed = await listAvailableGeminiModels();
+  const tryModels = [
+    ...new Set([getDefaultGeminiModel(), ...listed, ...FALLBACK_MODELS]),
+  ].filter(isListingSuitableModel);
+  const prompt = `Translate this Urdu product name into a concise, natural English e-commerce product name.
+Preserve brand names, model numbers, sizes, colors, and other factual details. Do not invent features.
+Return only JSON in this exact shape: {"title":"English product name"}
+Product name: ${JSON.stringify(sourceName)}`;
+
+  let lastError = "Gemini could not suggest an English product name.";
+  let quotaFailures = 0;
+  for (const model of tryModels) {
+    const { res, data } = await callGeminiGenerate(apiKey, model, prompt, 0.2);
+    if (res.ok) {
+      const text =
+        data?.candidates?.[0]?.content?.parts?.map((part) => part.text).filter(Boolean).join("") || "";
+      if (!text) {
+        lastError = "Gemini returned an empty English name suggestion.";
+        continue;
+      }
+      return {
+        title: normalizeEnglishProductName(parseJsonFromModelText(text)),
+        model_used: model,
+      };
+    }
+
+    const rawMessage = data?.error?.message || data?.error?.status || `Gemini API error (${res.status})`;
+    lastError = friendlyGeminiError(rawMessage, res.status);
+    if (isQuotaOrRateLimitError(res, rawMessage)) {
+      quotaFailures += 1;
+      continue;
+    }
+    if (res.status === 404 || /not found|invalid model|does not exist/i.test(String(rawMessage))) {
+      continue;
+    }
+    throw new Error(lastError);
+  }
+
+  if (quotaFailures > 0) {
+    throw new Error(
+      "Gemini free tier quota is used up for all models we tried. Wait a few minutes or enable billing in Google AI Studio."
     );
   }
   throw new Error(lastError);

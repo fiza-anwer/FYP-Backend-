@@ -28,6 +28,47 @@ function toCountryCode(value) {
   return COUNTRY_NAME_TO_ISO[v.toLowerCase()] || v.substring(0, 2).toUpperCase();
 }
 
+export function normalizeShippingAddress(value) {
+  const ship = value && typeof value === "object" ? value : {};
+  const addressLines = [
+    ship.address1 || ship.address_1,
+    ship.address2 || ship.address_2,
+    ship.address3 || ship.address_3,
+    ship.address4 || ship.address_4,
+    ship.address5 || ship.address_5,
+  ]
+    .map((part) => String(part || "").trim())
+    .filter(Boolean);
+  const country = String(ship.country_code || ship.countryCode || ship.country || "").trim();
+
+  return {
+    address1: addressLines.join(", "),
+    city: String(ship.city || "").trim(),
+    postal_code: String(
+      ship.postal_code || ship.postal_code_zip || ship.post_code || ship.postcode || ship.zip || ""
+    ).trim(),
+    country_code: /^(pak|pakistan)$/i.test(country) ? "PK" : toCountryCode(country),
+    name: String(
+      ship.name ||
+        ship.contact_person ||
+        [ship.first_name, ship.last_name].filter(Boolean).join(" ") ||
+        ""
+    ).trim(),
+    first_name: String(ship.first_name || "").trim(),
+    last_name: String(ship.last_name || "").trim(),
+    phone: String(ship.phone || ship.phone1 || ship.mobile || "").trim(),
+  };
+}
+
+export function mergeShippingAddress(existing = {}, incoming = {}) {
+  const merged = { ...existing };
+  for (const [key, value] of Object.entries(incoming)) {
+    if (value) merged[key] = value;
+    else if (merged[key] == null) merged[key] = "";
+  }
+  return merged;
+}
+
 /**
  * Run order import for a single tenant: find active company_integrations, fetch orders, save to orders collection.
  */
@@ -86,21 +127,14 @@ export async function runOrderImportForTenant(tenantName) {
           ? parsedCreatedAt
           : existing?.created_at || new Date();
         const ship =
-  raw.shipping_address ||
-  raw.shippingAddress ||
-  raw.address_shipping || // Daraz
-  raw.address_billing || // Daraz fallback
-  {};
-const shipping_address = {
-  address1: ship.address1 || ship.address_1 || "",
-  city: ship.city || "",
-  postal_code: ship.zip || ship.postal_code || ship.postal_code_zip || ship.post_code || "",
-  country_code: toCountryCode(ship.country_code || ship.country),
-  name: ship.name || [ship.first_name, ship.last_name].filter(Boolean).join(" ") || "",
-  first_name: ship.first_name || "",
-  last_name: ship.last_name || "",
-  phone: ship.phone || "",
-};
+          raw.shipping_address ||
+          raw.shippingAddress ||
+          raw.address_shipping ||
+          raw.addressShipping ||
+          raw.address_billing ||
+          {};
+        const shipping_address = normalizeShippingAddress(ship);
+        const hasShippingAddress = Object.values(shipping_address).some((value) => Boolean(value));
         const lineItems = [];
         const rawLines = raw.line_items || [];
         for (const li of rawLines) {
@@ -135,9 +169,21 @@ const shipping_address = {
           await increaseAllocatedForOrderLineItems(tenantDb, lineItems);
           totalImported++;
         } else {
+          const update = {
+            raw,
+            line_items: lineItems,
+            created_at: createdAt,
+            updated_at: new Date(),
+          };
+          if (hasShippingAddress) {
+            update.shipping_address = mergeShippingAddress(existing.shipping_address, shipping_address);
+          }
+          if (typeof order.email === "string" && order.email.trim()) {
+            update.email = order.email.trim();
+          }
           await ordersColl.updateOne(
             { external_id: order.external_id, source: order.source || slug },
-            { $set: { shipping_address, raw, line_items: lineItems, created_at: createdAt, updated_at: new Date() } }
+            { $set: update }
           );
           totalUpdated++;
         }

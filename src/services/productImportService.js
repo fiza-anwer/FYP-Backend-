@@ -8,6 +8,7 @@ import { ShopifyIntegration } from "../integrations/Shopify.js";
 import { DarazIntegration } from "../integrations/Daraz.js";
 import { normalizeSku } from "../utils/productTextFormatting.js";
 import { withShopifyChannelSkus } from "../utils/channelSkus.js";
+import { shouldSyncProductToPlatform } from "../utils/productIntegrationScope.js";
 import { forEachConcurrent } from "./forEachConcurrent.js";
 import { persistDarazCredentialsIfChanged, withPersistedDarazCredentials } from "./darazCredentialService.js";
 
@@ -334,11 +335,14 @@ export async function runPushPendingProductsForTenant(tenantName) {
       _id: { $nin: productIdsPushed },
     })
     .toArray();
+  const pendingForShopify = pending.filter((product) =>
+    shouldSyncProductToPlatform(product, "shopify")
+  );
 
   let pushed = 0;
   const errors = [];
 
-  await forEachConcurrent(pending, MAX_CONCURRENT_PRODUCT_PUSHES, async (p) => {
+  await forEachConcurrent(pendingForShopify, MAX_CONCURRENT_PRODUCT_PUSHES, async (p) => {
     const productTypeTrimmed = p.product_type != null ? String(p.product_type).trim() : "";
     if (!productTypeTrimmed) return;
 
@@ -427,10 +431,11 @@ export async function runPushPendingProductsToDarazForTenant(tenantName) {
     .filter((ci) => ci.credentials)
     .map((ci) => (ci.company_id instanceof ObjectId ? ci.company_id : new ObjectId(ci.company_id)));
 
-  const products = await productsColl
+  const products = (await productsColl
     .find({ company_id: { $in: companyIds } })
     .limit(500)
-    .toArray();
+    .toArray())
+    .filter((product) => shouldSyncProductToPlatform(product, "daraz"));
 
   const productIds = products.map((product) => product._id);
   const [channelMappings, inventory] = await Promise.all([

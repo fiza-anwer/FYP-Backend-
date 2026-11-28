@@ -214,6 +214,13 @@ export async function fetchOrdersPage(
   return json.data || {};
 }
 
+/** Fetch full details for one order. */
+export async function fetchOrderDetails(accessToken, orderId) {
+  const json = await darazGet("/order/get", { order_id: String(orderId) }, accessToken);
+  const data = json.data || {};
+  return data.order || data;
+}
+
 /** Fetch line items for an order. */
 export async function fetchOrderItems(accessToken, orderId) {
   const json = await darazGet("/order/items/get", { order_id: String(orderId) }, accessToken);

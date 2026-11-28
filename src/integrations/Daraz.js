@@ -5,6 +5,7 @@ import {
   fetchSellerProfile,
   fetchProductsPage,
   fetchOrdersPage,
+  fetchOrderDetails,
   fetchOrderItems,
   updateProductPriceQuantity,
 } from "./darazApi.js";
@@ -71,6 +72,32 @@ function mapDarazProduct(item) {
   };
 }
 
+function getDarazOrderEmail(order) {
+  const candidates = [
+    order?.customer_email,
+    order?.buyer_email,
+    order?.email,
+    order?.customer?.email,
+    order?.customer?.email_address,
+    order?.buyer?.email,
+    order?.buyer?.email_address,
+    order?.customer_info?.email,
+    order?.buyer_info?.email,
+    order?.address_shipping?.email,
+    order?.address_billing?.email,
+  ];
+  return (
+    candidates
+      .filter((value) => typeof value === "string")
+      .map((value) => value.trim())
+      .find(
+        (email) =>
+          /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) &&
+          !/[*…]/.test(email)
+      ) || ""
+  );
+}
+
 function mapDarazOrder(order, items = []) {
   const orderId = String(order.order_id ?? order.order_number ?? "");
   const lineItems = items.map((li) => ({
@@ -80,13 +107,31 @@ function mapDarazOrder(order, items = []) {
     price: parseFloat(li.item_price ?? li.paid_price ?? li.price ?? 0) || 0,
   }));
 
-  const ship = order.address_shipping || order.address_billing || {};
-  const raw = { ...order, line_items: lineItems.length ? lineItems : items };
+  const ship =
+    order.address_shipping ||
+    order.shipping_address ||
+    order.addressShipping ||
+    order.address_billing ||
+    {};
+  const email = getDarazOrderEmail({
+    ...order,
+    address_shipping: order.address_shipping || ship,
+  });
+  const raw = {
+    ...order,
+    line_items: lineItems.length ? lineItems : items,
+    shipping_address: {
+      ...ship,
+      first_name: ship.first_name || order.customer_first_name || "",
+      last_name: ship.last_name || order.customer_last_name || "",
+      phone: ship.phone || ship.phone1 || ship.mobile || order.customer_phone || "",
+    },
+  };
 
   return {
     external_id: orderId,
     order_number: order.order_number || orderId,
-    email: order.customer_email || order.buyer_email || "",
+    email,
     total: parseFloat(order.price ?? order.total_amount ?? order.grand_total ?? 0) || 0,
     financial_status: order.payment_method || order.statuses?.[0] || "",
     fulfillment_status: order.statuses?.join(",") || order.status || "",
@@ -282,6 +327,18 @@ export class DarazIntegration {
         const orders = Array.isArray(data.orders) ? data.orders : [];
         for (const order of orders) {
           const orderId = order.order_id ?? order.order_number;
+          let detailedOrder = order;
+          if (orderId && !getDarazOrderEmail(order)) {
+            try {
+              const details = await fetchOrderDetails(accessToken, orderId);
+              if (details && typeof details === "object") {
+                detailedOrder = { ...order, ...details };
+              }
+            } catch (err) {
+              if (DarazIntegration.isAccessTokenError(err)) throw err;
+              console.warn("[Daraz] order detail fetch failed for", orderId, err.message);
+            }
+          }
           let items = [];
           if (orderId) {
             try {
@@ -295,7 +352,7 @@ export class DarazIntegration {
           if (items.length === 0 && Array.isArray(order.order_items)) {
             items = order.order_items;
           }
-          all.push(mapDarazOrder(order, items));
+          all.push(mapDarazOrder(detailedOrder, items));
         }
         if (orders.length < limit) break;
         offset += limit;

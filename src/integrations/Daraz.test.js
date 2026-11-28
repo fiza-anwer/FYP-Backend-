@@ -140,6 +140,116 @@ test("shares an in-flight Daraz token refresh for concurrent requests", async ()
   }
 });
 
+test("maps Daraz customer email and shipping address fields", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAppKey = process.env.DARAZ_APP_KEY;
+  const originalAppSecret = process.env.DARAZ_APP_SECRET;
+  process.env.DARAZ_APP_KEY = "test-app-key";
+  process.env.DARAZ_APP_SECRET = "test-app-secret";
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith("/orders/get")) {
+      return jsonResponse({
+        code: "0",
+        data: {
+          orders: [
+            {
+              order_id: "daraz-order-1",
+              customer: { email: "buyer@example.com" },
+              address_shipping: {
+                first_name: "Test",
+                last_name: "Buyer",
+                address1: "Main Road",
+                address2: "House 10",
+                city: "Karachi",
+                post_code: "75500",
+                country: "Pakistan",
+                phone: "03001234567",
+              },
+            },
+          ],
+          count: 1,
+        },
+      });
+    }
+    if (url.pathname.endsWith("/order/items/get")) {
+      return jsonResponse({ code: "0", data: { order_items: [] } });
+    }
+    throw new Error(`Unexpected Daraz API request: ${url.pathname}`);
+  };
+
+  try {
+    const [order] = await DarazIntegration.fetchOrders({ access_token: "test-access-token" });
+
+    assert.equal(order.email, "buyer@example.com");
+    assert.equal(order.raw.shipping_address.address1, "Main Road");
+    assert.equal(order.raw.shipping_address.address2, "House 10");
+    assert.equal(order.raw.shipping_address.post_code, "75500");
+    assert.equal(order.raw.shipping_address.first_name, "Test");
+    assert.equal(order.raw.shipping_address.last_name, "Buyer");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalAppKey === undefined) delete process.env.DARAZ_APP_KEY;
+    else process.env.DARAZ_APP_KEY = originalAppKey;
+    if (originalAppSecret === undefined) delete process.env.DARAZ_APP_SECRET;
+    else process.env.DARAZ_APP_SECRET = originalAppSecret;
+  }
+});
+
+test("fetches Daraz order details when the order list has no usable email", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAppKey = process.env.DARAZ_APP_KEY;
+  const originalAppSecret = process.env.DARAZ_APP_SECRET;
+  const requestedPaths = [];
+  process.env.DARAZ_APP_KEY = "test-app-key";
+  process.env.DARAZ_APP_SECRET = "test-app-secret";
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    requestedPaths.push(url.pathname);
+    if (url.pathname.endsWith("/orders/get")) {
+      return jsonResponse({
+        code: "0",
+        data: {
+          orders: [
+            {
+              order_id: "daraz-order-detail-1",
+              customer_email: "buyer***@example.com",
+            },
+          ],
+          count: 1,
+        },
+      });
+    }
+    if (url.pathname.endsWith("/order/get")) {
+      return jsonResponse({
+        code: "0",
+        data: {
+          customer_email: "buyer@example.com",
+          address_shipping: { address1: "Detail Street", city: "Karachi" },
+        },
+      });
+    }
+    if (url.pathname.endsWith("/order/items/get")) {
+      return jsonResponse({ code: "0", data: { order_items: [] } });
+    }
+    throw new Error(`Unexpected Daraz API request: ${url.pathname}`);
+  };
+
+  try {
+    const [order] = await DarazIntegration.fetchOrders({ access_token: "test-access-token" });
+
+    assert.ok(requestedPaths.some((path) => path.endsWith("/order/get")));
+    assert.equal(order.email, "buyer@example.com");
+    assert.equal(order.raw.shipping_address.address1, "Detail Street");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalAppKey === undefined) delete process.env.DARAZ_APP_KEY;
+    else process.env.DARAZ_APP_KEY = originalAppKey;
+    if (originalAppSecret === undefined) delete process.env.DARAZ_APP_SECRET;
+    else process.env.DARAZ_APP_SECRET = originalAppSecret;
+  }
+});
+
 test("creates a Daraz listing when a Shopify product has an external ID", async () => {
   const originalCreateProduct = DarazIntegration.createProduct;
   const originalSetInventory = DarazIntegration.setInventory;

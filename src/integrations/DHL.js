@@ -242,6 +242,13 @@ function buildReceiver(shipping) {
   }
   const phone = shipping.phone || "0000000000";
 
+  const contactInformation = {
+    companyName: name || "Recipient",
+    fullName: name,
+    phone: phone || "0000000000",
+  };
+  if (shipping.email) contactInformation.email = String(shipping.email).trim();
+
   return {
     postalAddress: {
       addressLine1: address1,
@@ -249,11 +256,7 @@ function buildReceiver(shipping) {
       postalCode,
       countryCode,
     },
-    contactInformation: {
-      companyName: name || "Recipient",
-      fullName: name,
-      phone: phone || "0000000000",
-    },
+    contactInformation,
   };
 }
 
